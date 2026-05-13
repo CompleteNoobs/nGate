@@ -1,0 +1,320 @@
+{{:LICENCE_HEADER_MIT}}
+
+
+= Nostr Hands-On — Send Your First Notes and DMs Through Your Own Relays =
+
+From CompleteNoobs
+
+Stage 2 of the Nostr learning path. Stage 1 ([[Nostr_Relay_With_a_3-Key_Whitelist_—_Two_Servers_on_Ubuntu_24.04_with_Docker|nostr-relay-with-whitelist]]) got you ''two private write-whitelisted relays'' running. This stage gets you actually ''using'' Nostr — sending public notes, sending encrypted DMs, subscribing to events, watching the raw protocol — using a single static HTML page that you can read, modify, and break.
+
+We deliberately skip Primal / nostrudel / Damus etc. for stage 2. Real clients hide the protocol behind a UX, and the noob ends up "using Nostr" without ever seeing what Nostr ''is''. Instead, you'll use <code>nostr-handson.html</code> from this folder — a one-file, no-install learning tool. After 30 minutes with it, you'll understand more about Nostr than most people who've used a client for months.
+
+'''End result of stage 2''': you can publish a signed Nostr event from your laptop, see it land on your private relay, query it back over the wire, send an encrypted DM between two of your whitelisted identities, and read every JSON message that flowed through the browser's developer console.
+
+== Why a hands-on page beats a real client for learning ==
+
+* Real clients pick relays for you, sign for you, decrypt for you, render for you. Magic = mystery = doesn't stick.
+* This page does ''nothing'' automatically. You connect each relay manually. You build each event manually. You pick filters manually. You see every signed JSON object before it leaves and after it arrives.
+* The whole thing is one HTML file with all logic in plain ES modules. <code>view-source:</code> in the browser ''is'' the tutorial. Read the comments inline as you click through the lessons.
+* When you ''do'' graduate to a real client, you'll know exactly what each setting in "Relays" / "DM" / "Notifications" maps to in the protocol.
+
+== Contents ==
+
+* [[#Prerequisites|1 Prerequisites]]
+* [[#Step_0:_Open_the_page|2 Step 0: Open the page (no install)]]
+* [[#Lesson_1:_Load_a_key|3 Lesson 1: Load a key]]
+* [[#Lesson_2:_Connect_a_relay|4 Lesson 2: Connect a relay]]
+* [[#Lesson_3:_Publish_your_first_public_note|5 Lesson 3: Publish your first public note]]
+* [[#Lesson_4:_Verify_on_the_server_with_nak|6 Lesson 4: Verify on the server with nak]]
+* [[#Lesson_5:_Subscribe_to_your_own_feed|7 Lesson 5: Subscribe to your own feed]]
+* [[#Lesson_6:_Open_a_second_identity_in_a_second_window|8 Lesson 6: Open a second identity in a second window]]
+* [[#Lesson_7:_Have_a_public-note_conversation|9 Lesson 7: Have a public-note conversation]]
+* [[#Lesson_8:_Send_an_encrypted_DM|10 Lesson 8: Send an encrypted DM (NIP-04)]]
+* [[#Lesson_9:_Read_the_raw_JSON|11 Lesson 9: Read the raw JSON]]
+* [[#Lesson_10:_Watch_the_firehose|12 Lesson 10: Watch the firehose (a public relay)]]
+* [[#Lesson_11:_Server-side_view|13 Lesson 11: Server-side view (Docker logs + nak)]]
+* [[#Lesson_12:_Break_things_on_purpose|14 Lesson 12: Break things on purpose]]
+* [[#What_this_page_does_NOT_do|15 What this page does NOT do]]
+* [[#Wisdom_for_the_Nostr_Noob|16 Wisdom for the Nostr Noob]]
+* [[#Where_to_go_after_this|17 Where to go after this]]
+
+== Prerequisites ==
+
+* '''Two relays from stage 1 working''' — <code>wss://nostr.hive-book.com</code> and <code>wss://nostr.v4call.com</code> (or your equivalents).
+* '''Three nsec keys''' generated and whitelisted on both relays. Stage 1 covered this. The keys can be from <code>nostr-gen.html</code>, your normal Nostr client, or <code>nak key generate</code>.
+* '''nak installed on your laptop''' (Stage 1 → Step 14 → Option 1C). Used in lessons 4 + 11.
+* '''A modern browser with developer tools''' — Brave, Firefox, Chrome, Safari all work. We'll reference Brave in screenshots since that's CompleteNoobs' default.
+* '''nostr-handson.html''' — sitting in this folder next to this wiki.
+
+== Step 0: Open the page (no install) ==
+
+Three ways to load <code>nostr-handson.html</code>; pick whichever you prefer:
+
+;'''Option A — file:// (simplest)'''
+:Just double-click the file in your file manager, or drag it into a browser tab. Address bar will show <code>file:///path/to/nostr-handson.html</code>. WebSocket-to-internet works fine from <code>file://</code>; no special server needed.
+
+;'''Option B — <code>python3 -m http.server</code> (if you prefer http://)'''
+:From the folder containing the file:
+: <code>python3 -m http.server 8000</code>
+:Then browse to <code>http://localhost:8000/nostr-handson.html</code>.
+
+;'''Option C — Host it on your relay box''' (clean URL, accessible from any device)
+:Drop the file into your relay's web root and serve via Caddy. Out of scope for this lesson; do it later if you want.
+
+The page imports its crypto + bech32 helpers from <code>esm.sh</code> on first load — that's a CDN fetch of <code>nostr-tools</code>. After that the page is fully functional even offline (until cache expires). '''Open the browser console (F12) before you click anything.'''
+
+== Lesson 1: Load a key ==
+
+# In Section 1, paste an <code>nsec1...</code> from one of your three whitelisted keys. Use a '''disposable / learning''' key — see the warning in the page.
+# Click <strong>Load Key</strong>.
+# The page derives + displays your <code>npub</code> and your hex pubkey.
+# Open your browser console — there's a system log line: <code>[system] - Loaded identity npub1abc…xyz4 {npub: ..., pubkey: ...}</code>.
+
+;'''What just happened'''
+* <code>nip19.decode("nsec1...")</code> turned your bech32 nsec into raw bytes.
+* <code>getPublicKey(privBytes)</code> ran a single secp256k1 scalar multiplication to derive your pubkey. Same math underlies BTC, ETH, Hive — Nostr just uses the result differently.
+* <code>nip19.npubEncode(pubkeyHex)</code> wrapped the pubkey in bech32 to get your <code>npub</code>.
+* The privkey is now sitting in <code>state.privkey</code> in browser memory. Closing the tab forgets it.
+
+;'''💡 Wisdom'''
+:'''An npub and a hex pubkey are the same key, just two encodings.''' Relays use hex internally. Clients display npub. Always 64 hex chars / always starts <code>npub1</code>. If you only see one form, you can convert any time with <code>nak decode npub1...</code>.
+
+== Lesson 2: Connect a relay ==
+
+# In Section 2 you'll see four pre-filled relays — your two privates plus <code>relay.damus.io</code> and <code>nos.lol</code> (popular publics).
+# Click <strong>Connect</strong> on <code>wss://nostr.hive-book.com</code> (or whichever of yours).
+# Status flips: <code>disconnected</code> → <code>connecting</code> → <code>open</code> (green).
+# Console gets one <code>[system]</code> entry per state change.
+
+;'''What just happened'''
+* <code>new WebSocket("wss://nostr.hive-book.com")</code> opened a TCP/TLS/WebSocket-upgrade chain to the relay.
+* The browser dev tools' <strong>Network</strong> tab → filter <strong>WS</strong> shows the connection. Click it → <strong>Messages</strong> sub-tab shows every frame in/out. Useful as a second view alongside section 5.
+
+;'''💡 Wisdom'''
+:'''A Nostr connection is just a WebSocket.''' Same plumbing as a chat room, a stock ticker, or a multiplayer game. Nothing magical at the transport layer. The protocol on top of it (REQ / EVENT / EOSE / OK / NOTICE / CLOSED) is what's "Nostr-y".
+
+== Lesson 3: Publish your first public note ==
+
+# Section 3 → "Public Note (kind 1)" tab is selected by default.
+# Type something memorable: <code>hello world from nostr-handson</code>.
+# Click <strong>Sign &amp; Publish</strong>.
+# Watch sections 5 + the console:
+:* <code>[out] EVENT kind=1 id=abc123…</code> with the full JSON.
+:* Then a <code>[in] OK abc123… accepted=true</code> from each connected relay.
+
+;'''What just happened — the most important JSON in Nostr'''
+:Click the JSON block in the log to expand. You'll see something like:
+ {
+   "kind": 1,
+   "created_at": 1746554000,
+   "tags": [],
+   "content": "hello world from nostr-handson",
+   "pubkey": "abc123…",      // hex pubkey, derived from your nsec
+   "id":     "deadbeef…",   // sha256 of [0,pubkey,created_at,kind,tags,content]
+   "sig":    "f00ba12…"     // schnorr signature of id, by your privkey
+ }
+:'''The id and sig are the whole proof.''' Anyone in the world holding only this JSON can verify it actually came from your pubkey and hasn't been tampered with — without ever talking to you, the relay, or anything.
+
+;'''💡 Wisdom'''
+:'''A Nostr event is just signed JSON.''' That's it. Every "post" / "DM" / "reaction" / "follow list" / "long-form article" / "zap receipt" / etc. is the same shape: a JSON object with <code>kind</code> picking the type, <code>tags</code> attaching metadata, and <code>content</code> being the body. Hundreds of kinds defined across NIPs, all the same fundamental wrapper.
+
+== Lesson 4: Verify on the server with nak ==
+
+You don't have to trust the page — go look at the relay directly.
+
+ nak req -k 1 -a YOUR_HEX_PUBKEY wss://nostr.hive-book.com
+
+(Use the hex pubkey from section 1 of the page, not the npub.)
+
+You should see your note printed. nak hits the WebSocket, sends a REQ with <code>kinds:[1], authors:[your-hex]</code>, prints every EVENT, then exits on EOSE.
+
+;'''💡 Wisdom'''
+:'''Whenever a client claims something is missing, query the relay directly.''' If nak finds the event but your client doesn't show it, the bug is in the client's relay config or filter, not in your publish. This single habit will save you days of debugging later.
+
+== Lesson 5: Subscribe to your own feed ==
+
+# Section 4 → click <strong>My events</strong>.
+# Watch the log:
+:* <code>[out] REQ sub-1</code> with filter <code>{kinds:[0,1,3,4,7], authors:[your-hex], limit:50}</code>.
+:* <code>[in] EVENT sub=sub-1 kind=1 ...</code> — your note from lesson 3 comes back.
+:* <code>[in] EOSE sub=sub-1</code> — "you've now seen all stored events; live updates continue."
+# Now post another note from section 3. It'll arrive immediately on the same subscription as a live event.
+
+;'''What just happened'''
+:A Nostr subscription is a long-lived REQ. Stored events flow first, then EOSE marks the catch-up boundary, then the relay streams new matches in real time until you CLOSE.
+
+;'''💡 Wisdom'''
+:'''Filters AND across fields, OR across filter objects.''' <code>{kinds:[1], authors:[X]}</code> means "kind 1 AND author X". Adding a second filter to the same REQ means "match either filter". This is how clients build complex feeds (your follows + your replies + your zaps) in one subscription.
+
+== Lesson 6: Open a second identity in a second window ==
+
+You want to send a message between two of your three whitelisted accounts. Two ways to have two identities at once:
+
+;'''Option A — Brave private window'''
+:File → New Private Window. Open <code>nostr-handson.html</code> there. Load identity B's nsec.
+
+;'''Option B — Two browsers'''
+:Brave for identity A, Firefox for identity B (or any other combination).
+
+You should now have ''two browser windows'', each showing the page, each with a different identity loaded. Treat them as Alice (account A) and Bob (account B).
+
+# In Bob's window, connect <code>wss://nostr.v4call.com</code> (Bob's home relay) AND <code>wss://nostr.hive-book.com</code> (so Bob can read what Alice writes).
+# In Alice's window, do the symmetrical: connect both relays.
+
+;'''💡 Wisdom'''
+:'''The single biggest source of "Nostr is broken" frustration is no shared relay between sender and recipient.''' Get this dual-relay setup working in both windows and you've eliminated 90% of all multi-account Nostr issues.
+
+== Lesson 7: Have a public-note conversation ==
+
+# Alice's window: section 4 → <strong>Lookup author…</strong> → paste Bob's npub. A REQ goes out for kinds 0+1 from Bob.
+# Bob's window: same in reverse. Look up Alice's npub.
+# Now Alice posts: <code>"Hi Bob, can you see this?"</code> Section 5 in Bob's window shows the incoming EVENT within a second.
+# Bob replies (still kind 1): <code>"Loud and clear, Alice."</code>
+# Alice's incoming subscription picks it up.
+
+;'''💡 Wisdom'''
+:'''This is the entire feed mechanism in Nostr.''' A real client wraps it in nicer UX, threading, mute lists, follow lists, but the wire protocol is exactly what you're seeing. There is no central server, no API key, no rate limit beyond what each relay chooses.
+
+== Lesson 8: Send an encrypted DM (NIP-04) ==
+
+# Alice's window → section 3 → <strong>DM (kind 4 / NIP-04)</strong> tab.
+# Recipient: paste Bob's npub.
+# Body: <code>"this is a secret"</code>.
+# Click <strong>Encrypt, Sign &amp; Publish</strong>.
+# Watch the outgoing event in section 5. Notice <code>content</code> is base64 ciphertext like <code>4QwT...?iv=Lk9P...</code>, not your plaintext. Notice <code>tags: [["p", "bob-hex"]]</code> — that's how the relay knows who to deliver to.
+# In Bob's window: section 4 → <strong>DMs to me</strong>.
+# Bob's subscription matches kind 4 with <code>#p</code> tag = Bob's hex. The relay sends Alice's encrypted event. Bob's page <strong>auto-decrypts</strong> because Bob's nsec is loaded. The log shows: <code>[in] DM (decrypted) from abc12345…wxyz: this is a secret</code>.
+
+;'''What just happened'''
+* '''Encryption (NIP-04 spec)''':
+:* shared = ECDH(Alice-priv, Bob-pub) = secp256k1 point's X coordinate (32 bytes).
+:* iv = 16 random bytes.
+:* ciphertext = AES-256-CBC(shared, iv, plaintext).
+:* content field = base64(ciphertext) + "?iv=" + base64(iv).
+* '''Decryption''' is the same with Bob-priv + Alice-pub — ECDH gives the same shared secret in either direction. That's the magic of Diffie-Hellman.
+* '''The relay sees''': sender pubkey, recipient pubkey (from p-tag), timestamp, ciphertext. It does NOT see the body.
+
+;'''⚠ Wisdom — NIP-04 limits'''
+:* Metadata (who-talks-to-whom + when + how often) is plaintext on the relay. A relay operator running a logger can build the social graph.
+:* NIP-44 is a newer encryption (ChaCha20 + HKDF + HMAC). Better authenticated encryption. Most clients support it.
+:* NIP-17 wraps NIP-44 in "gift wraps" (kind 1059) that hide sender + recipient on the relay. Modern best practice. Not implemented in this page yet — too complex for stage 2.
+:* '''For real privacy use a client that supports NIP-17.''' This page is for ''learning'', not for OPSEC.
+
+== Lesson 9: Read the raw JSON ==
+
+Open the browser console (F12 → Console tab). Filter / search for <code>[in]</code> or <code>[out]</code>:
+
+* '''An outgoing kind 1''' has the canonical structure from lesson 3.
+* '''An outgoing kind 4''' is the same shape but: kind=4, content=ciphertext, tags=[["p", recipient]].
+* '''An incoming EVENT''' is a 3-tuple: <code>["EVENT", subId, eventObject]</code>.
+* '''An incoming OK''' is a 4-tuple: <code>["OK", eventId, accepted (bool), reason (string)]</code>. <code>accepted=false</code> with a clear reason is how relays reject (e.g. <code>"blocked: pubkey not authorized to publish"</code>).
+* '''A NOTICE''' is a server-side gripe: <code>["NOTICE", "could not parse command"]</code>. You saw this in stage 1 lesson 14.
+
+;'''Try this in the console''':
+:After connecting a relay, type:
+: <code>["EVENT", "fakeId"]</code>   ← intentionally malformed
+:Then send it manually:
+: <code>state.relays.get('wss://nostr.hive-book.com').ws.send(JSON.stringify(["EVENT","fakeId"]))</code>
+:You'll get a NOTICE back from the relay rejecting the malformed message. Your page literally bypasses no security to do this — you're just speaking the protocol directly.
+
+;'''💡 Wisdom'''
+:'''Once you can build and parse these JSON shapes by hand, you can write a Nostr client.''' That's the whole protocol. Everything else is UX.
+
+== Lesson 10: Watch the firehose (a public relay) ==
+
+# Make sure <code>wss://relay.damus.io</code> is connected (it's pre-filled).
+# Section 4 → <strong>Firehose</strong> button. This sends <code>{kinds:[1], limit:20}</code> with no author filter.
+# Watch the log fill with kind-1 notes from random Nostr users worldwide.
+# Notice each one has a different <code>pubkey</code>. Each one is independently signed.
+
+;'''💡 Wisdom'''
+:'''A public relay is just a private relay without the whitelist.''' Same protocol, same code, same <code>nostr-rs-relay</code> binary on the other end (or its peers). Yours is private only because of three lines in <code>config.toml</code>.
+
+== Lesson 11: Server-side view (Docker logs + nak) ==
+
+SSH into your relay box. In one terminal:
+
+ cd /opt/nostr-relay && docker compose logs -f nostr-relay
+
+In another terminal (or back on your laptop):
+
+ nak req -k 4 -a YOUR_HEX_PUBKEY wss://nostr.hive-book.com
+
+Now from the page, send another note. Watch the docker logs — the relay's perspective: a connection arrives, an EVENT is received, it's persisted, an OK goes back. Send a kind 4 — same flow, but the relay only sees ciphertext.
+
+Try this with a non-whitelisted key (load a fresh disposable nsec, try to publish): the relay logs the rejection, the page receives <code>OK accepted=false reason="blocked: ..."</code>.
+
+;'''💡 Wisdom'''
+:'''Relays are accountable infrastructure.''' You can audit exactly what you accepted and rejected. This is part of why people run their own — you control the policy and you can prove you're enforcing it.
+
+== Lesson 12: Break things on purpose ==
+
+Healthy thing to do — surface error paths so you'll recognise them later.
+
+# '''Disconnect a relay, then publish.''' Page shows <code>[error] No open relays — nothing was published</code>.
+# '''Publish without a key loaded.''' Page alerts. (Try this in the console too: clear <code>state.privkey</code> and click Send.)
+# '''Subscribe with a malformed filter.''' From the console: <code>state.relays.get('wss://nostr.hive-book.com').ws.send(JSON.stringify(["REQ","junk",{"foo":"bar"}]))</code> — the relay either ignores or NOTICEs.
+# '''Send a DM to yourself.''' Auto-decrypts. Useful for confirming the encrypt/decrypt round-trip works locally without involving a second account.
+# '''Refresh the page mid-session.''' Privkey is forgotten. Relays disconnect. Section 5 clears. Nothing persists. Re-paste nsec and reconnect. (This is by design — keys never persist.)
+# '''Cancel all subs, then post.''' The post still goes out (publishing is independent of subscriptions). Subs only affect ''reading''.
+
+;'''💡 Wisdom'''
+:'''Most "Nostr won't work" reports are one of: no key loaded, no relay open, sender/recipient relay mismatch, or a stale subscription.''' Once you've intentionally hit each of these in a controlled setting, you'll diagnose them in seconds in the wild.
+
+== What this page does NOT do ==
+
+Stage 2 deliberately stops where the protocol ends and where ''client UX'' begins. The page does NOT:
+
+* Render profiles (kind 0 metadata) — you only see "from <hex>".
+* Build threaded reply trees (NIP-10 e/p tag markers).
+* Render reactions (kind 7) as little hearts.
+* Auto-discover who's on which relay (NIP-65 outbox model).
+* Show notifications, mentions, or unread counts.
+* Handle long-form articles (kind 30023) with markdown.
+* Send or receive zaps (NIP-57 Lightning).
+* Use modern DMs (NIP-17 gift-wrapped). NIP-04 only.
+* Maintain mute lists, follow lists, or any persistence between page loads.
+* Use a NIP-07 browser extension for safer key handling.
+
+Each of these is a layer that real clients add on top of the protocol. Once you're comfortable with what's happening here, every one of them makes sense as a small specific addition rather than as opaque magic.
+
+== Wisdom for the Nostr Noob ==
+
+;'''Use disposable keys for this page'''
+:The privkey lives in browser JS memory. Acceptable for learning, not for valuable identities. For real use → NIP-07 extension (nos2x / Alby) or a remote signer (NIP-46 / Nsec.app).
+
+;'''No shared relay = no message delivered'''
+:If sender's writes and recipient's reads don't overlap, you're shouting into the void. There is no central postman. This is THE concept.
+
+;'''The console is your second feed'''
+:Section 5 is a curated UI; the browser console (F12) has every byte mirrored to <code>console.log()</code>. Use Ctrl+F to search across hundreds of events. Filter by <code>[in]</code> / <code>[out]</code> / <code>[system]</code> / <code>[error]</code>.
+
+;'''Read the page source'''
+:All logic is in one <code>&lt;script type="module"&gt;</code> block at the bottom of the file. ~600 lines, well-commented. Edit it. Add a button. Add a kind. The page is yours — break it, learn from breaking it.
+
+;'''nak is the second tool you'll always reach for'''
+:When the page says "I sent it", confirm with <code>nak req -k 1 -a HEX wss://...</code>. When the page says "nothing came back", confirm with the same command. The two tools cross-check each other and remove all "but the client said..." doubt.
+
+;'''Kinds are the schema'''
+:0 = profile, 1 = note, 3 = follow list, 4 = old DM, 5 = delete request, 6 = repost, 7 = reaction, 9735 = zap receipt, 10002 = relay list, 30023 = long-form article, 1059 = NIP-17 gift wrap, ... hundreds of NIPs. The full list lives at [https://github.com/nostr-protocol/nips github.com/nostr-protocol/nips]. Surprisingly readable.
+
+;'''Time stamps are seconds, not milliseconds'''
+:Nostr's <code>created_at</code> is Unix seconds (<code>Math.floor(Date.now()/1000)</code>). Putting milliseconds will make events look ~50 years in the future and many relays drop them.
+
+;'''"Delete" is fuzzy'''
+:NIP-09 has a "request deletion" event. Relays may or may not honour it. Other relays still have copies. Treat anything you publish as permanent.
+
+== Where to go after this ==
+
+In rough order of "what to learn next":
+
+# '''NIP-65 outbox model''' — publish a relay-list event (kind 10002) declaring your read + write relays. This is the spec for "where can people find me." Most modern clients use it. Add a "publish my relay list" button to <code>nostr-handson.html</code> as a first hack.
+# '''Profile metadata (kind 0)''' — set name, about, picture. Same shape as kind 1, but content is JSON. Replaceable: only the latest event survives per pubkey.
+# '''NIP-05 verification''' — map <code>username@yourdomain.com</code> to your pubkey via a <code>/.well-known/nostr.json</code> on your domain. Stage 1's relays could host this trivially.
+# '''NIP-07 (browser extension signing)''' — install nos2x or Alby. Modify <code>nostr-handson.html</code> so it calls <code>window.nostr.signEvent()</code> instead of holding the privkey. This is the right pattern for any real key.
+# '''NIP-44 + NIP-17''' — modern DMs. NIP-44 = better symmetric encryption. NIP-17 = wrap NIP-44 in gift wraps so the relay can't see who-talked-to-whom.
+# '''Zaps (NIP-57)''' — Lightning tipping over Nostr. You'll need a Lightning wallet first.
+# '''A real client''' — Primal, nostrudel, Damus, Amethyst, Iris, Coracle, Snort, Habla. Pick one. Notice that under the hood it's doing exactly what your page does, just with prettier UX.
+# '''v4call's planned Nostr layer''' — see [[V4call]] and the project's NOSTR-DESIGN-NOTES.md. Your private relays are the natural infrastructure for that, with one of your 3 keys being your v4call server's identity.
+
+You now have a Nostr identity you understand, a relay you control, and a tool that exposes the entire protocol. That's a stronger foundation than 99% of Nostr users start with. 🌿

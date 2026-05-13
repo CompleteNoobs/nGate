@@ -1,0 +1,507 @@
+{{:LICENCE_HEADER_MIT}}
+
+
+= nGate — Deploy to a Fresh Ubuntu 24.04 Server =
+
+From CompleteNoobs
+
+This guide walks an operator through deploying nGate on top of an existing
+[[Nostr_Relay_With_a_3-Key_Whitelist|stage-1 nostr-rs-relay]] running on a
+Vultr Ubuntu 24.04 box. After this you'll have:
+
+* The relay still running as before.
+* Caddy still terminating TLS as before.
+* '''A new sidecar container''' (<code>ngate-sync</code>) running alongside,
+  scanning Hive every 6 hours, updating the relay's <code>pubkey_whitelist</code>
+  automatically when v4call-server operators announce themselves.
+* '''Cryptographic enforcement''': only posts that prove ownership of both
+  the Hive account AND the Nostr key (via mutual attestation) get whitelisted.
+
+== Prerequisites ==
+
+You've already:
+
+* Followed [[Nostr_Relay_With_a_3-Key_Whitelist|stage 1]] and have a working
+  <code>wss://nostr.YOUR-DOMAIN/</code> relay.
+* Followed [[Nostr_Hands-On|stage 2]] enough to be comfortable with the
+  Nostr protocol fundamentals.
+* Have at least one v4call-server announce post on Hive (signed via
+  <code>server-sign.html</code>, announced via <code>server-announce.html</code>)
+  to use as test input.
+
+If you don't have a v4call-server post yet, you can still deploy nGate and
+test it (the scan will find existing operators' posts), you just won't be in
+the whitelist until you publish your own.
+
+== Contents ==
+
+* [[#Step_1:_SSH_to_the_relay_box|1 Step 1: SSH to the relay box]]
+* [[#Step_2:_Install_runtime_dependencies|2 Step 2: Install runtime dependencies]]
+* [[#Step_3:_Clone_nGate|3 Step 3: Clone nGate]]
+* [[#Step_4:_Install_npm_dependencies|4 Step 4: Install npm dependencies]]
+* [[#Step_5:_Bootstrap_config.toml|5 Step 5: Bootstrap config.toml]]
+* [[#Step_6:_Create_seed.toml|6 Step 6: Create seed.toml (CRITICAL — don't skip)]]
+* [[#Step_7:_Configure_ngate.yaml|7 Step 7: Configure ngate.yaml]]
+* [[#Step_8:_Dry-run_the_chain|8 Step 8: Dry-run the chain]]
+* [[#Step_9:_Merge_sidecar_into_docker-compose.yml|9 Step 9: Merge sidecar into docker-compose.yml]]
+* [[#Step_10:_Build_and_start_the_sidecar|10 Step 10: Build and start the sidecar]]
+* [[#Step_11:_Watch_a_cycle|11 Step 11: Watch a cycle]]
+* [[#Step_12:_Routine_monitoring|12 Step 12: Routine monitoring]]
+* [[#Updating_nGate|13 Updating nGate]]
+* [[#Known_gotchas|14 Known gotchas]]
+* [[#Removing_nGate|15 Removing nGate (back to manual whitelist)]]
+
+== Step 1: SSH to the relay box ==
+
+ ssh root@nostr.YOUR-DOMAIN
+
+If you set up a non-root user during stage 1, use that and prefix everything
+with <code>sudo</code> as needed.
+
+== Step 2: Install runtime dependencies ==
+
+nGate needs a few things beyond what stage 1 installed. Inside the sidecar
+container, all deps are auto-installed (Alpine image bakes Node + jq + curl
++ docker-cli + yq). Outside the container — for dry-runs and manual sync
+commands — install on the host:
+
+ apt update
+ apt install -y nodejs npm jq curl
+
+Verify:
+
+ for c in bash curl jq sed awk node; do command -v $c >/dev/null && echo "✓ $c" || echo "✗ $c MISSING"; done
+
+All six should print ✓.
+
+== Step 3: Clone nGate ==
+
+The relay lives at <code>/opt/nostr-relay/</code>. Clone nGate next to it so
+the bind-mount paths in <code>docker-compose.example.yml</code> work:
+
+ cd /opt/nostr-relay
+ git clone https://github.com/CompleteNoobs/nGate src
+
+That gives you:
+
+ /opt/nostr-relay/
+ ├── config.toml             ← from stage 1
+ ├── Caddyfile               ← from stage 1
+ ├── docker-compose.yml      ← from stage 1
+ ├── data/                   ← from stage 1 (relay sqlite DB)
+ ├── caddy_data/             ← from stage 1
+ └── src/                    ← NEW (nGate repo)
+     ├── scripts/
+     ├── ngate.yaml.example
+     ├── docker-compose.example.yml
+     └── ...
+
+For convenience, symlink the scripts dir + copy the YAML template up to
+<code>/opt/nostr-relay/</code> (so bind-mount paths are simple):
+
+ cd /opt/nostr-relay
+ ln -s src/scripts scripts
+ cp src/ngate.yaml.example ngate.yaml
+
+Now <code>scripts/ngate-*.sh</code> work from <code>/opt/nostr-relay/</code>.
+
+'''💡 Tip''': you can also clone nGate anywhere else and adjust the
+<code>NGATE_*</code> env-vars in <code>ngate.yaml</code> to point at the
+right paths. The clone-into-<code>src/</code>-and-symlink approach is just
+the path of least resistance.
+
+== Step 4: Install npm dependencies ==
+
+The Hive ECDSA + Nostr schnorr helpers are Node scripts that need
+<code>@hiveio/dhive</code> and <code>nostr-tools</code>:
+
+ cd /opt/nostr-relay/src/scripts
+ npm install
+
+This creates <code>node_modules/</code> in the scripts folder (~35MB).
+Gitignored — won't bloat the repo. One-time cost; subsequent
+<code>git pull</code> + <code>npm install</code> is incremental.
+
+Verify both deps are present:
+
+ ls node_modules/@hiveio/dhive/package.json
+ ls node_modules/nostr-tools/package.json
+
+Both should exist.
+
+== Step 5: Bootstrap config.toml ==
+
+Your stage-1 <code>config.toml</code> has an <code>[authorization]</code>
+section with hand-pasted hex pubkeys. nGate manages a specific block of
+this file between BEGIN/END marker comments. Run the bootstrap to wrap your
+existing section:
+
+ cd /opt/nostr-relay
+ ./scripts/ngate-apply.sh --bootstrap
+
+Output should look like:
+
+ ngate-apply: ✓ Bootstrapped — wrapped [authorization] in BEGIN/END markers.
+ ngate-apply:   ngate-apply now manages everything between those markers.
+ ngate-apply:   Operator-edited keys go in: /opt/nostr-relay/seed.toml
+
+Inspect <code>config.toml</code>:
+
+ cat /opt/nostr-relay/config.toml
+
+You should see your existing pubkey_whitelist entries, now wrapped:
+
+ # === BEGIN NGATE-MANAGED — DO NOT EDIT BY HAND ===
+ [authorization]
+ pubkey_whitelist = [
+   "your_existing_hex_1",
+   "your_existing_hex_2",
+   "your_existing_hex_3",
+ ]
+ # === END NGATE-MANAGED ===
+
+'''⚠ From this point forward, don't hand-edit between those markers.'''
+nGate will overwrite that region on every sync. Manual additions go in
+<code>seed.toml</code> (next step).
+
+== Step 6: Create seed.toml (CRITICAL — don't skip) ==
+
+'''Why this matters''': nGate's first <code>--apply</code> with
+<code>--allow-removals</code> can delete entries that aren't currently
+backed by a valid v4call-server post on Hive — including yours, if your
+operator key isn't yet announced. Without a seed entry, you can lock
+yourself out.
+
+Make a <code>seed.toml</code> at <code>/opt/nostr-relay/seed.toml</code>
+listing every hex pubkey that should ALWAYS be allowed, regardless of
+discovery state. Most importantly: your own operator key.
+
+ nano /opt/nostr-relay/seed.toml
+
+Paste:
+
+ # nGate seed list — operator-managed, never auto-removed.
+ # One hex pubkey per line. Comments allowed.
+ #
+ # Critical: include your own operator key here so nGate can't accidentally
+ # lock you out if your v4call-server post temporarily fails verification.
+
+ your_operator_hex_pubkey_here   # @noblemage's nostr key
+
+If you've been running stage 1 with 3 manual keys, you might want all 3 as
+seeds initially. Worst case is one extra entry in the whitelist; not a
+correctness problem.
+
+== Step 7: Configure ngate.yaml ==
+
+Open the YAML config and edit for your relay:
+
+ nano /opt/nostr-relay/ngate.yaml
+
+The defaults are sensible. Key fields to customise:
+
+* <code>instance_name</code> — appears in logs. e.g. <code>nostr-hive-book</code>.
+* <code>scan_interval_seconds</code> — default 21600 (6 hours). If you
+  want faster updates and don't mind the Hive RC, drop to 3600 (1 hour).
+* <code>gate.account</code> — <code>escrow</code> (default; gates the
+  operational account that holds caller funds) or <code>hive_account</code>
+  (gates the announce-signing account).
+* <code>gate.min_hp</code> — minimum HP staked. <code>3</code> is a fine
+  test threshold. Production servers might want 30+.
+* <code>gate.min_token_*</code> — leave blank to disable; set to a
+  Hive-Engine token symbol + amount if you want token-gating.
+* <code>max_consecutive_failures</code> — 3 = ~18 hours of absence before
+  remove. Keep default unless you have a reason.
+* <code>restart_command</code> — default <code>docker restart nostr-relay</code>
+  matches the container_name in your docker-compose.yml. Don't change
+  unless you renamed the relay container.
+* <code>paths.*</code> — only change if you put nGate somewhere other than
+  <code>/opt/nostr-relay/</code>.
+
+== Step 8: Dry-run the chain ==
+
+Before turning the sidecar loose, run the full pipeline manually in
+<code>--dry-run</code> mode (no writes, no restarts):
+
+ cd /opt/nostr-relay
+ ./scripts/ngate-scan.sh 2>/dev/null \
+   | ./scripts/ngate-verify.sh 2>&1 \
+   | NGATE_MIN_HP=3 ./scripts/ngate-gate.sh 2>&1 \
+   | ./scripts/ngate-apply.sh
+
+Expected stderr output sequence:
+
+* <code>ngate-scan:</code> ok, N posts
+* <code>ngate-verify:</code> OK / REJECT / skip for each candidate
+* <code>ngate-gate:</code> OK / REJECT for each verified candidate
+* <code>ngate-apply:</code> seed: X loaded, current: Y in whitelist, stdin:
+  Z passed, summary: add=… keep=… tolerate=… remove=… → DRY RUN, no
+  files changed.
+
+Read the output. Check that:
+
+* Your own operator key is in the SEED count.
+* Your v4call-server post (if you have one) appears as OK in verify and
+  passes the gate (or fails for an understandable reason).
+* The summary "new whitelist size" looks plausible.
+* config.toml hasn't been modified (<code>cat config.toml</code> shows the
+  same content as after bootstrap).
+
+If anything looks off, fix it (re-sign + re-announce, adjust ngate.yaml,
+adjust seed.toml) before going live.
+
+== Step 9: Merge sidecar into docker-compose.yml ==
+
+Your stage-1 <code>docker-compose.yml</code> already has the <code>nostr-relay</code>
+and <code>caddy</code> services. The nGate sidecar adds a third. Open both
+files:
+
+ nano /opt/nostr-relay/docker-compose.yml
+ # In another terminal:
+ cat /opt/nostr-relay/src/docker-compose.example.yml
+
+Copy the <code>ngate-sync</code> service block from the example into your
+real <code>docker-compose.yml</code>. The block looks like:
+
+ services:
+   # ... your existing nostr-relay + caddy services ...
+
+   ngate-sync:
+     build:
+       context: .
+       dockerfile: src/scripts/Dockerfile
+     container_name: ngate-sync
+     restart: unless-stopped
+     volumes:
+       - ./src/scripts:/app/scripts
+       - ./ngate.yaml:/app/ngate.yaml:ro
+       - ./seed.toml:/app/seed.toml:ro
+       - ./config.toml:/app/config.toml
+       - ./state.json:/app/state.json
+       - /var/run/docker.sock:/var/run/docker.sock
+     environment:
+       - NGATE_YAML=/app/ngate.yaml
+     depends_on:
+       - nostr-relay
+     networks:
+       - relaynet
+
+(Note: <code>./src/scripts</code> instead of <code>./scripts</code> because
+we kept the cloned repo at <code>src/</code> and symlinked. If you did it
+differently, adjust the volume paths.)
+
+Make sure to pre-create the state.json so the bind-mount works:
+
+ echo '{"last_run":"","last_apply":"","restart_log":[],"candidates":{}}' > /opt/nostr-relay/state.json
+
+'''⚠ Security note''': the sidecar mounts <code>/var/run/docker.sock</code>
+so it can <code>docker restart nostr-relay</code>. This gives the sidecar
+container effective root on the host. Acceptable on a single-purpose relay
+box. NOT acceptable on a multi-tenant machine. If that bothers you, set
+<code>restart_command</code> in <code>ngate.yaml</code> to a noop (e.g.
+<code>true</code>) and restart the relay manually after each cycle —
+configuration writes still work; only the restart is skipped.
+
+== Step 10: Build and start the sidecar ==
+
+ cd /opt/nostr-relay
+ docker compose build ngate-sync
+ docker compose up -d ngate-sync
+
+First build downloads node:20-alpine + yq + docker-cli (~150MB). Subsequent
+builds are fast (cached layers). On startup the sidecar runs
+<code>npm install</code> inside the bind-mounted scripts dir if
+<code>node_modules</code> isn't present — should be quick if you already
+ran step 4.
+
+Check the container's running:
+
+ docker compose ps ngate-sync
+
+Should show <code>Up</code>.
+
+== Step 11: Watch a cycle ==
+
+Tail the logs:
+
+ docker compose logs -f ngate-sync
+
+The sidecar runs ONE cycle immediately at startup, then sleeps for
+<code>scan_interval_seconds</code> between cycles. The first cycle should
+show:
+
+ [2026-05-13T…] [nostr-hive-book] starting ngate-sync instance=… interval=21600s …
+ [2026-05-13T…] [nostr-hive-book] ─── cycle starting ───
+ ngate-scan: trying https://api.hive.blog …
+ ngate-scan:   ok, N posts
+ ngate-scan: scan complete
+ ngate-verify: OK @cnoobs/call.completenoobs.com — Hive sig + Nostr attestation valid …
+ ngate-verify: OK @v4call/v4call.com — Hive sig + Nostr attestation valid …
+ ngate-verify: OK @hive-book/hive-book.com — Hive sig + Nostr attestation valid …
+ ngate-gate: config: account=escrow mode=or hp_enabled=1 (>=3, delegated=false) …
+ ngate-gate: OK @cnoobs/… — passed via hp hp=…
+ ngate-gate: complete — total=3 passed=3 rejected=0 errors=0
+ ngate-apply: seed: 1 pubkey(s) loaded from /app/seed.toml
+ ngate-apply: current: 3 pubkey(s) in /app/config.toml whitelist
+ ngate-apply: stdin: 3 candidate(s) passed gate this run
+ ngate-apply: summary: add=… keep=… tolerate=0 remove=0 seed=1 → new whitelist size = …
+ ngate-apply: ✓ wrote new whitelist to /app/config.toml
+ ngate-apply: restarting relay: docker restart nostr-relay
+ ngate-apply: ✓ restart succeeded
+ [2026-05-13T…] [nostr-hive-book] ─── cycle complete (apply ok) ───
+ [2026-05-13T…] [nostr-hive-book] sleeping 21600s until next cycle
+
+After this, your <code>config.toml</code>'s nGate-managed block should
+reflect the discovered+gated set.
+
+Verify the relay still works:
+
+ docker compose ps nostr-relay   # Up
+ # From your laptop:
+ nak req -k 1 -a YOUR_HEX wss://nostr.YOUR-DOMAIN
+
+If it returns events, the restart worked cleanly.
+
+== Step 12: Routine monitoring ==
+
+;'''Status snapshot'''
+:From inside the sidecar:
+: <code>docker compose exec ngate-sync /app/scripts/ngate-status.sh</code>
+:Or from the host (env-vars on the command):
+:
+:  NGATE_YAML=/opt/nostr-relay/ngate.yaml \
+:  NGATE_STATE_PATH=/opt/nostr-relay/state.json \
+:  NGATE_CONFIG_PATH=/opt/nostr-relay/config.toml \
+:  NGATE_SEED_PATH=/opt/nostr-relay/seed.toml \
+:  /opt/nostr-relay/scripts/ngate-status.sh
+
+;'''Logs'''
+:* <code>docker compose logs -f ngate-sync</code> — live stream
+:* <code>tail -F /opt/nostr-relay/ngate-sync.log</code> — bind-mounted host file
+
+;'''Manual sync'''
+:If you want a fresh cycle right now (don't wait 6 hours):
+: <code>docker compose exec ngate-sync /app/scripts/ngate-sync.sh --once</code>
+:Or restart the sidecar (runs one cycle on startup):
+: <code>docker compose restart ngate-sync</code>
+
+;'''Inspect state.json'''
+:Shows per-key first-seen, last-seen, consecutive_misses, source
+:(discovery|seed|removed):
+: <code>jq . /opt/nostr-relay/state.json</code>
+
+== Updating nGate ==
+
+When the repo updates:
+
+ cd /opt/nostr-relay/src
+ git pull
+ cd scripts && npm install   # in case dep versions changed
+ cd /opt/nostr-relay
+ docker compose build ngate-sync   # only needed if Dockerfile changed
+ docker compose restart ngate-sync
+
+The scripts dir is bind-mounted, so script-only changes take effect on next
+sync without rebuild. Restart picks them up immediately.
+
+== Known gotchas ==
+
+;'''"Keychain not detected" in server-announce''' (browser-side, not nGate)
+:Some browsers don't expose <code>window.hive_keychain</code> even with the
+:extension installed (iOS Safari, Brave on iOS, etc.). server-announce.html
+:has a posting-key paste fallback that uses dhive to broadcast directly —
+:scroll past the Keychain button to the "POSTING KEY PASTE" section. Key
+:never leaves your browser.
+
+;'''nGate-verify rejects with "no nostr_attestation in well-known OR post"'''
+:Your v4call-server post is pre-attestation, OR the well-known doesn't have
+:the <code>nostr_attestation</code> field, OR the post body doesn't have a
+:<code>NOSTR-ATTESTATION:</code> base64 line. Re-sign in
+:<code>server-sign.html</code> (Option B canonical) and re-announce. The
+:full chain produces both the well-known field AND the post-body line in
+:one signed event.
+
+;'''nGate-verify rejects with "Hive signature DID NOT verify"'''
+:Most common cause: signature was computed under a DIFFERENT canonical
+:payload shape than what nGate-verify reconstructs. Re-sign with the
+:current server-sign.html (which produces the Option B / SHORT canonical
+:that nGate-verify and v4call's existing federation code both expect).
+
+;'''nGate-verify rejects with "attestation v4call_hive_account tag (X) ≠ post's HIVE-ACCOUNT (Y)"'''
+:You signed the attestation with one Hive account name (e.g.
+:<code>hive-book</code>) but the Hive post declares a different one (e.g.
+:<code>hive-book.com</code>). Re-sign with consistent values across the
+:whole flow (server-sign → server-announce → Hive post).
+
+;'''Sidecar can't restart relay ("permission denied" on docker.sock)'''
+:Less common, but if the relay box has docker access locked down: either
+:loosen perms on <code>/var/run/docker.sock</code> (default world-writable
+:on most distros) OR change <code>restart_command</code> in ngate.yaml to
+:a noop and restart the relay manually after each sync.
+
+;'''Sidecar in a restart loop'''
+:Probably an invalid <code>ngate.yaml</code> or missing
+:<code>node_modules</code>. Check:
+: <code>docker compose logs --tail=50 ngate-sync</code>
+:The startup log shows YAML parse errors clearly. If
+:<code>node_modules</code> is missing the sidecar will install it on first
+:start; subsequent runs are fast.
+
+;'''"Restart cap hit" in logs'''
+:nGate refuses to restart the relay more than
+:<code>max_restarts_per_day</code> times in 24h. If you see this
+:repeatedly, something upstream is causing the whitelist to flap.
+:Investigate state.json and check whether candidates are missing-then-back
+:repeatedly (suggests Hive RPC flakiness or a v4call-server post
+:disappearing temporarily).
+
+;'''"Sanity bound triggered" in logs'''
+:nGate refused to apply because the result would have removed every
+:non-seed entry. Triggered when upstream had errors AND
+:<code>--allow-removals</code> was somehow set. With the sidecar's
+:PIPESTATUS-aware logic, this shouldn't happen in practice; if it does,
+:check upstream phase exit codes.
+
+== Removing nGate (back to manual whitelist) ==
+
+If you want to disable nGate and go back to hand-editing
+<code>config.toml</code>:
+
+ cd /opt/nostr-relay
+ docker compose down ngate-sync
+ docker compose rm -f ngate-sync
+
+Then manually edit <code>config.toml</code>:
+
+ nano /opt/nostr-relay/config.toml
+
+Either:
+
+* Delete the BEGIN/END marker comments (keep the
+  <code>[authorization]</code> section between them as-is), OR
+* Replace the entire managed block with a hand-curated whitelist.
+
+Restart the relay to pick up the new config:
+
+ docker compose restart nostr-relay
+
+The relay reads <code>config.toml</code> on startup regardless of markers.
+nGate's markers are JUST for nGate's internal "what to manage" logic; the
+relay itself ignores them as TOML comments.
+
+== When you're done ==
+
+After 24 hours of clean runs, nGate has handled at least one normal cycle
+(scan + verify + gate + maybe-apply). At that point you can:
+
+* Stake some HIVE on your test operator to confirm a transition (off-gate
+  → passing the gate after stake).
+* Publish a v4call-server post for a new operator and watch it get picked
+  up on the next cycle.
+* Deploy nGate to your second relay box (nostr.v4call.com) with a
+  staggered scan time (set <code>scan_interval_seconds</code> the same but
+  schedule the startup at a different time of day for faster
+  federation-wide pickup).
+
+For the next phase of work (stage 3.6 refinements + stage 4 strfry
+migration), see [[STATUS.md]] in the nGate repo.

@@ -1,0 +1,955 @@
+{{:LICENCE_HEADER_MIT}}
+
+
+= nGate — Auto-Whitelist a Nostr Relay From v4call-server Posts on Hive =
+
+From CompleteNoobs
+
+Stage 3 of the Nostr learning path. Stages 1 and 2 ([[Nostr_Relay_With_a_3-Key_Whitelist_—_Two_Servers_on_Ubuntu_24.04_with_Docker|nostr-relay-with-whitelist]] and [[Nostr_Hands-On_—_Send_Your_First_Notes_and_DMs_Through_Your_Own_Relays|nostr-handson]]) gave you two private write-whitelisted relays you maintain by hand. This stage turns "by hand" into "by Hive": the relay's whitelist is rebuilt automatically from <code>v4call-server</code> announce posts on the Hive blockchain, gated by economic conditions of your choosing (HP staked, custom token held, or both).
+
+'''The big idea''': anyone can run a v4call server. Anyone can publish a <code>v4call-server</code> Hive post. Only servers whose Hive account meets your relay's economic conditions get added to your relay's write-whitelist. The gate is enforced relay-side, audited per-cycle, and entirely on-chain — no API keys, no payment processor, no central directory.
+
+This is also the first piece of '''nGate''' — a small standalone gate-script that wraps a Nostr relay with discovery + verification + on-chain gating + whitelist rewriting. Stage 3 builds nGate on top of <code>nostr-rs-relay</code> using a cron-rewriter pattern. Stage 4 (later) migrates to <code>strfry</code> for live policy plugin gating with no restarts. The model from stage 3 carries over unchanged to strfry — only the enforcement layer swaps.
+
+'''End result of stage 3''': a sidecar <code>ngate-sync</code> service running alongside your relay, scanning Hive every 6 hours, gating discovered v4call servers by your declared HP/token thresholds, and rewriting <code>config.toml</code> to reflect the current eligible set — fully automatic, fully auditable, fully reversible if anything goes wrong.
+
+== Why this matters ==
+
+Stage 1's whitelist was three hex strings hand-pasted into a config file. Fine for proving the concept; doesn't scale. Real federation-discovery use means new v4call servers come and go over weeks and months, and an operator who hand-maintains every whitelist is a single point of failure.
+
+nGate flips this:
+* '''The Hive blockchain becomes the source of truth''' for "who's in the federation right now."
+* '''Economic conditions become the trust filter''' — owning a Hive account isn't enough; the operator must demonstrate skin-in-the-game (HP staked, tokens held, etc.).
+* '''The relay operator's job''' is just running nGate and choosing the gate config; the whitelist itself is downstream of public on-chain state.
+
+This pattern matches v4call's existing lobby anti-spam gate (<code>LOBBY_POST_MIN_HP</code>, <code>LOBBY_POST_MIN_TOKEN</code>) and reuses the same env-var shape so operators who already understand v4call grok nGate instantly.
+
+== The five phases of stage 3 ==
+
+We build nGate in five small phases, each producing a runnable script. Every phase is a single file, reads stdin or a config, writes stdout or a state file. They compose: <code>ngate-scan | ngate-verify | ngate-gate | ngate-apply</code>.
+
+{| class="wikitable"
+|-
+! # !! Phase !! Script !! Status !! What it does
+|-
+| 3.1 || Discovery   || <code>ngate-scan.sh</code>   || '''✅ shipped''' || Pulls v4call-server posts from Hive, parses each block, prints candidates as NDJSON.
+|-
+| 3.2 || Verification || <code>ngate-verify.sh</code> + <code>lib/ngate-verify-sig.js</code> || '''✅ shipped''' || Fetches each candidate's signed <code>/.well-known/v4call-server.json</code>, validates the Hive signature, confirms the Nostr key in the well-known matches the post, detects within-scan hex collisions.
+|-
+| 3.3 || Gating       || <code>ngate-gate.sh</code>   || '''✅ shipped''' || Applies your declared HP / token thresholds against verified candidates. Gate config via env vars (HP, token, OR/AND, target account).
+|-
+| 3.4 || Rewriter     || <code>ngate-apply.sh</code>  || '''✅ shipped''' || Reads gated set, computes diff against current <code>config.toml</code> + state.json, rewrites between BEGIN/END markers, restarts the relay. Defaults to <code>--dry-run</code>; needs explicit <code>--apply</code> to write. Handles seed.toml, miss-tolerance, restart cap, sanity bound.
+|-
+| 3.5 || Glue + Docker || <code>ngate-sync.sh</code> + <code>ngate-status.sh</code> + Dockerfile + <code>ngate.yaml</code> || '''✅ ready to test''' || Reads YAML config once at startup, runs the full chain on a self-paced loop, inspects PIPESTATUS to auto-toggle <code>--allow-removals</code>. Sidecar runs alongside relay + Caddy in docker-compose.
+|}
+
+We're starting with phase 3.1 only. Read-only. Zero risk to your live relays. After you've run it and the output looks right, we move to phase 3.2 in the next session.
+
+== Contents ==
+
+* [[#Prerequisites|1 Prerequisites]]
+* [[#Architecture_Overview|2 Architecture Overview]]
+* [[#A_Note_on_Convergence_Across_Relays|3 A Note on Convergence Across Relays]]
+* [[#Configuration_(YAML)_—_what_we're_locking_in|4 Configuration (YAML) — what we're locking in]]
+* [[#Lesson_1:_Run_ngate-scan_and_read_the_output|5 Lesson 1: Run ngate-scan and read the output]]
+* [[#Lesson_2:_Try_to_break_it|6 Lesson 2: Try to break it]]
+* [[#Lesson_3:_Setup_for_Phase_3.2_(Node_+_dhive)|7 Lesson 3: Setup for Phase 3.2 (Node + dhive)]]
+* [[#Lesson_4:_Run_scan_pipe_verify|8 Lesson 4: Run scan | verify and read the output]]
+* [[#Lesson_5:_Try_to_break_phase_3.2|9 Lesson 5: Try to break phase 3.2]]
+* [[#What_phase_3.2_still_does_NOT_do|10 What phase 3.2 still does NOT do]]
+* [[#Lesson_6:_Phase_3.3_intro_+_gate_config|11 Lesson 6: Phase 3.3 intro + gate config]]
+* [[#Lesson_7:_Three_HP_test_scenarios|12 Lesson 7: Three HP test scenarios]]
+* [[#Lesson_8:_Token_gate_test|13 Lesson 8: Token gate test]]
+* [[#Lesson_9:_Try_to_break_phase_3.3|14 Lesson 9: Try to break phase 3.3]]
+* [[#What_phase_3.3_still_does_NOT_do|15 What phase 3.3 still does NOT do]]
+* [[#Lesson_10:_Phase_3.4_intro_+_safety_rails|16 Lesson 10: Phase 3.4 intro + safety rails]]
+* [[#Lesson_11:_Sandbox_dry-run|17 Lesson 11: Sandbox dry-run (no relay touched)]]
+* [[#Lesson_12:_Sandbox_apply_+_state.json|18 Lesson 12: Sandbox apply + state.json]]
+* [[#Lesson_13:_Miss_tolerance_+_safety_bound|19 Lesson 13: Miss tolerance + safety bound]]
+* [[#Lesson_14:_Real_relay_bootstrap|20 Lesson 14: Real relay bootstrap (when ready)]]
+* [[#What_phase_3.4_still_does_NOT_do|21 What phase 3.4 still does NOT do]]
+* [[#Lesson_15:_ngate.yaml_+_ngate-sync_intro|22 Lesson 15: ngate.yaml + ngate-sync intro]]
+* [[#Lesson_16:_Sandbox_run_with_--once|23 Lesson 16: Sandbox run with --once]]
+* [[#Lesson_17:_Deploy_the_Docker_sidecar|24 Lesson 17: Deploy the Docker sidecar]]
+* [[#Lesson_18:_Monitoring_with_ngate-status|25 Lesson 18: Monitoring with ngate-status]]
+* [[#What_phase_3.5_still_does_NOT_do|26 What phase 3.5 still does NOT do]]
+* [[#Wisdom_drops|27 Wisdom drops]]
+* [[#What's_next|28 What's next]]
+
+== Prerequisites ==
+
+* '''Stages 1 and 2 done.''' Two relays running. You're comfortable with the Nostr protocol from doing the nostr-handson lessons.
+* '''At least one v4call-server post on Hive.''' If you've used <code>server-announce.html</code> at least once (which you have — the wiki test showed three fresh announces), you're set.
+* '''Local tools''': <code>bash 4+</code>, <code>curl</code>, <code>jq</code>, <code>sed</code>, <code>awk</code>. Most Linux distros have all of these out of the box. macOS users may need <code>brew install jq</code>.
+* '''The nGate scripts folder''': clone this v4call repo, the scripts live in <code>nGate/scripts/</code>. For phase 3.1 you can run them on your laptop — no need to deploy to the relay box yet.
+
+To check dependencies on your laptop:
+
+ for c in bash curl jq sed awk; do command -v $c >/dev/null && echo "✓ $c" || echo "✗ $c MISSING"; done
+
+All five should print ✓.
+
+== Architecture Overview ==
+
+ ┌─────────────────────────────────────────────────────────────┐
+ │            HIVE BLOCKCHAIN  (truth layer)                   │
+ │   v4call-server posts  +  /.well-known/v4call-server.json   │
+ └────────────┬─────────────────┬──────────────────────────────┘
+              │                 │
+              │ scan            │ fetch + verify
+              ▼                 ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │            nGate sidecar  (this stage's build)              │
+ │                                                             │
+ │   3.1 scan      3.2 verify      3.3 gate     3.4 rewrite    │
+ │     ↓             ↓               ↓             ↓           │
+ │   candidates → verified → eligible → whitelist diff         │
+ └────────────────────────────────────────────────┬────────────┘
+                                                  │
+                                                  │ 3.4 writes
+                                                  ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │   nostr-rs-relay's config.toml  →  pubkey_whitelist=[...]   │
+ │   (restart if changed)                                      │
+ └─────────────────────────────────────────────────────────────┘
+                  │
+                  │ enforces
+                  ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │   wss://nostr.hive-book.com  /  wss://nostr.v4call.com      │
+ │   accepts EVENTs only from currently-whitelisted hex pubkeys│
+ └─────────────────────────────────────────────────────────────┘
+
+'''Key principle: separation of concerns.'''
+* '''nGate''' = the gate. Decides who's allowed to publish on its relay. That's it.
+* '''v4call''' = the discovery layer. Decides which relays to scan for federation peers.
+* They compose without coupling. Either side can evolve independently.
+
+== A Note on Convergence Across Relays ==
+
+A natural question: '''if your nostr.hive-book.com relay discovers a new server, does the new server's hex automatically appear on nostr.v4call.com too?'''
+
+'''No.''' Each relay's nGate runs its own scan independently. They each pull from the same Hive chain data, so they ''converge'' to the same whitelist within one scan interval — but there's no direct relay-to-relay sync.
+
+'''Why this is fine''' (and actually preferred):
+* No protocol needed for relay coordination — keeps the model simple.
+* No partial-failure mode where one relay's bad config corrupts another's whitelist.
+* Operators can run different gate thresholds per relay (one strict, one permissive) without conflict.
+
+'''Pro tip — stagger your scan times.''' If hive-book's nGate scans at 09:00 and v4call's scans at 12:00, a federation-wide observer sees a new server reachable on at least one relay within ~3 hours of the announce post. Both within ~6 hours. With a 6-hour scan interval, staggering halves the worst-case time-to-discovery for the federation as a whole.
+
+The same model applies to strfry in stage 4 — strfry instances don't gossip policy state with each other either. nGate is always the per-relay discovery loop; strfry only changes what the loop ''writes to'' (a live policy daemon socket instead of a static config file).
+
+== Configuration (YAML) — what we're locking in ==
+
+Stage 3's config schema. Saved to <code>nGate/scripts/ngate.yaml</code> in stage 3.5; for phase 3.1 the script doesn't read this yet, but document it now so the shape doesn't drift.
+
+ # nGate configuration — applies to one relay
+ # ─────────────────────────────────────────────
+
+ # Identity of this nGate instance (only used in logs and state files)
+ instance_name: nostr-hive-book
+
+ # Hive RPC nodes for discovery + balance checks. Tried in order; first
+ # successful response wins. Failures don't kick anyone — see the ADD-only
+ # rule in this wiki.
+ hive_nodes:
+   - https://api.hive.blog
+   - https://api.deathwing.me
+   - https://hive-api.arcange.eu
+   - https://api.openhive.network
+
+ # How often the cron loop fires. 6 hours (= 21600 seconds) is the default.
+ # Lower = faster discovery, more Hive RC consumed. Higher = slower discovery.
+ scan_interval_seconds: 21600
+
+ # Gate condition — choose what to enforce
+ # ─────────────────────────────────────────
+ # Set to 0 / blank to disable that gate. If multiple gates are set,
+ # gate_mode controls how they combine: "or" = pass any → in;
+ # "and" = pass all → in. Same shape as v4call's lobby gate.
+ gate:
+   # Which account on the v4call-server post we read balances from.
+   # "escrow"       — recommended; gates the operational account
+   # "hive_account" — gates the brand-new vanity account
+   account: escrow
+
+   # Minimum Hive Power (in HP, not VESTS). 0 = disabled.
+   min_hp: 3
+   # If true, delegated HP counts toward the threshold. Default false
+   # (owned-only) so a whale can't rent privileges out via delegation.
+   include_delegated_hp: false
+
+   # Minimum Hive-Engine token holding. Symbol blank = disabled.
+   min_token_symbol: ''
+   min_token_amount: 0
+   include_staked_token: true
+
+   # How to combine multiple non-zero gates above.
+   mode: or
+
+ # Pubkeys that bypass the gate entirely (always allowed)
+ # ───────────────────────────────────────────────────────
+ # Lives in seed.toml (separate file) — see Wisdom drops.
+
+ # Failure tolerance — when a candidate transiently fails verification or
+ # gate-check, give them this many consecutive misses before removing.
+ max_consecutive_failures: 3
+
+ # Logging
+ verbose: false   # set true to log per-success too (default: only failures)
+
+ # Restart safety net — if nGate's diff calculation goes haywire, this
+ # caps how often we'll restart the relay container per day.
+ max_restarts_per_day: 6
+
+This file does NOT exist yet — phase 3.1 has no config to read. We'll create it for real in phase 3.5. Showing it here so you see where stage 3 is heading and can flag anything that doesn't make sense.
+
+== Lesson 1: Run ngate-scan and read the output ==
+
+Phase 3.1's script does ''one'' thing: ask Hive for v4call-server posts, parse each post's V4CALL-SERVER-V1 block, print one candidate per line as compact JSON. Read-only. Zero risk to anything.
+
+;Step 1 — open a terminal and run it
+:From the v4call repo root:
+: <code>./nGate/scripts/ngate-scan.sh</code>
+:Default limit is 20 (Hive's max for this query type). Your output will look something like the example below — actual contents will vary based on what's on Hive when you run it.
+
+;Step 2 — read the output
+:'''Stderr''' (progress messages, prefixed <code>ngate-scan:</code>):
+: ngate-scan: trying https://api.hive.blog …
+: ngate-scan:   ok, 5 posts
+: ngate-scan: scan complete
+:'''Stdout''' (one JSON object per line, NDJSON format):
+: {"author":"cnoobs","permlink":"v4call-server-1778239116","domain":"call.completenoobs.com","hive_account":"cnoobs","escrow":"v4call-escrow","fee_account":"cnoobs","federation_ws":"wss://call.completenoobs.com/federation","verify_url":"https://call.completenoobs.com/.well-known/v4call-server.json","software":"v4call","protocol":"0.3","nostr_pubkey":"npub1cxgaen…","nostr_pubkey_hex":"c191dccd…","declared":"2026-05-08T11:18:36Z"}
+: {"author":"v4call","permlink":"v4call-server-1778239068","domain":"v4call.com",…}
+: {"author":"hive-book","permlink":"v4call-server-1778238996","domain":"hive-book.com",…}
+:Each candidate has every field from the V4CALL-SERVER-V1 block. Empty fields print as empty strings (e.g. older announces published before the Nostr fields existed will have <code>"nostr_pubkey":""</code> and <code>"nostr_pubkey_hex":""</code>).
+
+;Step 3 — pipe it through jq for prettier reading
+:Plain output is dense. To inspect one field:
+: <code>./nGate/scripts/ngate-scan.sh 2>/dev/null | jq -r '.author + " → " + .domain + " → " + .nostr_pubkey_hex'</code>
+:Should print something like:
+: cnoobs → call.completenoobs.com → c191dccd8370bcae3632f52ed476a89915959532801639dfcb9b326dd81ba12c
+: v4call → v4call.com → 4e06d691682de81a3a9e70438c35bc7911dfa1658ea171b333a5f6f7126112bf
+: hive-book → hive-book.com → 56857969d5ff72afc693017eec55b4b6ce226fe561156887850ad5e9681c27a9
+:'''Filter to candidates with a Nostr key''':
+: <code>./nGate/scripts/ngate-scan.sh 2>/dev/null | jq -c 'select(.nostr_pubkey_hex != "")'</code>
+:'''Count''':
+: <code>./nGate/scripts/ngate-scan.sh 2>/dev/null | wc -l</code>
+:'''Verbose verbosity — see the redirect-stderr trick''':
+: All progress messages go to stderr (<code>2>/dev/null</code> drops them). All actual data goes to stdout. Pure pipeable.
+
+;Step 4 — try the limit flag
+: <code>./nGate/scripts/ngate-scan.sh --limit 3</code>
+:Hive caps this query at 20. Anything outside 1..20 prints a clear error and exits non-zero.
+
+;Step 5 — read the script source
+:The whole file is ~150 lines of bash. Open <code>nGate/scripts/ngate-scan.sh</code> in your editor. Walk through it. Comments explain each section. There's nothing magic — just curl + jq + a few sed/awk one-liners.
+
+== Lesson 2: Try to break it ==
+
+The point isn't to harm anything (it's read-only); it's to surface error paths so you'll recognise them later.
+
+;'''A. Network down'''
+:Take down your network briefly while running. Stderr should walk through every node, log each as unreachable, and exit code 1 with <code>ngate-scan: ALL nodes failed; aborting</code>. No partial output on stdout — it's all-or-nothing per scan.
+
+;'''B. Bad arguments'''
+: <code>./ngate-scan.sh --limit hello</code> → <code>--limit must be an integer</code>, exit 2.
+: <code>./ngate-scan.sh --limit 100</code> → <code>--limit must be 1..20</code> (Hive node cap), exit 2.
+: <code>./ngate-scan.sh --weird</code> → <code>unknown arg</code>, exit 2.
+
+;'''C. Hive node returning weird data'''
+:Harder to provoke deliberately, but you'll see this in the wild eventually. The script logs HTTP/JSON-RPC errors to stderr with the actual error message — copy/paste of v4call's own <code>hivePost</code> diagnostic pattern (the v0.12 fix that surfaced silent Hive node failures).
+
+;'''D. A v4call-server post with a malformed block'''
+:If someone publishes a v4call-server-tagged post without the V4CALL-SERVER-V1 wrapper, the script logs <code>skip @author/permlink — no V4CALL-SERVER-V1 block found</code> to stderr and continues. Stdout stays clean.
+
+;'''E. Empty result set'''
+:If Hive returns 0 posts (unlikely but possible if all v4call-server posts age out of the recent window), the script exits 0 with no stdout output. That's correct behaviour — "no candidates today" is not an error.
+
+== What phase 3.1 does NOT do (yet) ==
+
+Each of these is the next phase's job. Naming them explicitly so you don't expect them in lesson 1's output:
+
+* '''No signature verification.''' A malicious actor could publish a fake <code>v4call-server</code> post claiming any domain + any Nostr key. Phase 3.1 emits it as a candidate. '''Phase 3.2''' filters those out by fetching the actual <code>/.well-known/v4call-server.json</code> at the claimed domain and verifying the signature against the Hive account's posting pubkey.
+* '''No HP / token gate.''' Every parsed candidate appears in the output regardless of their economic state. '''Phase 3.3''' applies your gate config.
+* '''No <code>config.toml</code> writing.''' Lesson 1's output is just printed; nothing on disk changes. '''Phase 3.4''' diffs against the existing whitelist and writes the new file (with a dry-run flag and restart safety net).
+* '''No cron, no sidecar.''' You're running it manually for now. '''Phase 3.5''' wraps everything in a Docker sidecar with a self-paced loop.
+* '''No deduplication.''' If two announces claim the same Nostr hex (forgery indicator), both appear in the output. Phase 3.2 detects the collision and rejects both as a forgery signal.
+
+== Lesson 3: Setup for Phase 3.2 (Node + dhive) ==
+
+Phase 3.2 verifies '''Hive ECDSA signatures'''. That's secp256k1 + SHA256 + a specific compact-signature format — implementable in pure bash but only if you enjoy reimplementing elliptic curves at 3am. Instead nGate uses a tiny Node.js helper (~30 lines) at <code>nGate/scripts/lib/ngate-verify-sig.js</code> that uses <code>@hiveio/dhive</code> — the exact same library v4call uses everywhere — to do the cryptography. Bash orchestrates everything else; Node only handles the verify step. Same library, same logic as the verify-button in <code>server-sign.html</code>. If it works in the browser, it works here.
+
+;Step 1 — install Node and npm
+:Ubuntu 24.04:
+: <code>sudo apt install -y nodejs npm</code>
+:Mac:
+: <code>brew install node</code>
+:Verify:
+: <code>node --version</code> (should be 18+)
+
+;Step 2 — install <code>@hiveio/dhive</code>
+:From the v4call repo root:
+: <code>cd nGate/scripts && npm install</code>
+:This creates a <code>node_modules/</code> folder (gitignored — won't pollute the repo) with about 35 MB of <code>@hiveio/dhive</code> + its deps. One-time cost.
+
+;Step 3 — sanity-check the helper directly
+:Without going through the full pipeline, you can drive the Node helper standalone:
+: <code>echo '{"payload":"hello","signature":"00","pubkey":"STMfoo"}' | node nGate/scripts/lib/ngate-verify-sig.js</code>
+:Should print <code>false</code> on stdout (because the inputs are nonsense) and a friendly error on stderr. That's the helper working — it returns a binary string that bash can branch on.
+
+;Step 4 — run the dependency check the script will do for you
+:From the repo root:
+: <code>./nGate/scripts/ngate-verify.sh < /dev/null</code>
+:If anything's missing it tells you exactly what (e.g. "ngate-verify: missing dependency 'node'" or "ngate-verify: @hiveio/dhive not installed").
+
+;'''💡 Why Node and not Python or pure bash?'''
+:Three reasons:
+:# '''Library reuse''': v4call already trusts <code>@hiveio/dhive</code> in browsers and on the server. Same code path = same correctness guarantees.
+:# '''Tiny surface''': ~30 lines of helper, one binary input/output contract. Bash never sees JS internals; Node never sees nGate state.
+:# '''Pure bash secp256k1 verify''' would be ~1000+ lines of bigint arithmetic and ECC point operations. Possible, but readable bash this is not.
+:You ''could'' swap in Python (<code>ecdsa</code> package) or any other language with a single-file rewrite of the helper — the bash side doesn't care which interpreter runs the helper, only that it reads JSON on stdin and prints "true" or "false" on stdout. Worth keeping as a future option if you want to drop the Node dep.
+
+== Lesson 4: Run scan | verify and read the output ==
+
+;Step 1 — run the chain
+:From the repo root:
+: <code>./nGate/scripts/ngate-scan.sh | ./nGate/scripts/ngate-verify.sh</code>
+:Expect to see a mix of '''OK''' lines on stderr (per-success) and '''skip''' or '''REJECT''' lines (per-failure or per-not-applicable), plus the verified candidates as NDJSON on stdout.
+
+;Step 2 — what each stderr line means
+:* <code>ngate-verify: skip @user/domain — no nostr_pubkey_hex</code>
+::Old announce that predates the Nostr fields. Not an error, not a rejection — just no eligibility (yet). Operator should re-run server-sign + server-announce to add Nostr.
+:* <code>ngate-verify: REJECT @user/domain — could not fetch verify_url</code>
+::Domain unreachable (DNS / TLS / 404). The well-known file isn't deployed at <code>/.well-known/v4call-server.json</code>, or the domain is down. Defense-in-depth catches this.
+:* <code>ngate-verify: REJECT @user/domain — well-known hive_account (X) ≠ post's HIVE-ACCOUNT (Y)</code>
+::A real mismatch — the operator's well-known and announce post disagree on the Hive account. Either an old well-known that was signed before the post fields changed, or a typo when signing. The operator should re-sign (<code>server-sign.html</code>) and confirm both files agree.
+:* <code>ngate-verify: REJECT @user/domain — well-known nostr_hex differs from post</code>
+::The operator's announce post claims one Nostr key, but their well-known declares a different one. Defense in depth caught a divergence — possibly a forgery, possibly the operator updated one file but not the other. Either way, the relay should NOT whitelist either key until they reconcile.
+:* <code>ngate-verify: REJECT @user/domain — signature DID NOT verify</code>
+::Worst-case rejection: well-known fetched, well-formed, claims exist, but the cryptographic signature doesn't match the Hive account's posting pubkey. Either a corrupted file, a wrong account on Hive (renamed/hijacked?), or a deliberate forgery. nGate refuses to play.
+:* <code>ngate-verify: FORGERY-FLAG hex=… claimed by both @A and @B — both will be REJECTED</code>
+::Two different Hive accounts' announces both name the SAME Nostr key in this scan. Even if both pass signature verification individually, nGate refuses to add the key — collision is itself the indicator. (See "wisdom drops" below for the threat model.)
+:* <code>ngate-verify: OK @user/domain — signature valid, hex …</code>
+::All checks passed. The candidate is emitted on stdout as NDJSON with three additional fields:
+::* <code>verified: true</code>
+::* <code>verified_at</code> (ISO timestamp)
+::* <code>posting_pubkey</code> (the STM-prefixed Hive posting pubkey that signed the well-known)
+
+;Step 3 — chain through jq for inspection
+:Verified candidates only:
+: <code>./nGate/scripts/ngate-scan.sh 2>/dev/null | ./nGate/scripts/ngate-verify.sh 2>/dev/null | jq -c '{author, domain, hex: .nostr_pubkey_hex}'</code>
+:Sample output:
+: {"author":"cnoobs","domain":"call.completenoobs.com","hex":"c191dccd…"}
+: {"author":"v4call","domain":"v4call.com","hex":"4e06d691…"}
+:These are the candidates phase 3.3 will gate on next session.
+
+;Step 4 — count and check
+:How many candidates passed?
+: <code>./nGate/scripts/ngate-scan.sh 2>/dev/null | ./nGate/scripts/ngate-verify.sh 2>/dev/null | wc -l</code>
+:How many were rejected vs skipped?
+: <code>./nGate/scripts/ngate-scan.sh 2>/dev/null | ./nGate/scripts/ngate-verify.sh 2>&1 1>/dev/null | grep -c REJECT</code>
+: <code>./nGate/scripts/ngate-scan.sh 2>/dev/null | ./nGate/scripts/ngate-verify.sh 2>&1 1>/dev/null | grep -c skip</code>
+
+;Step 5 — read the source
+:Two files this time:
+:* <code>nGate/scripts/ngate-verify.sh</code> — the orchestrator. ~200 lines. Two passes: first to detect within-scan collisions, second to verify each candidate end-to-end. Comments inline for every step.
+:* <code>nGate/scripts/lib/ngate-verify-sig.js</code> — the Node helper. ~30 lines. Read JSON from stdin, run dhive verification, print true/false.
+:Open both side-by-side. The whole verification model fits on one screen each.
+
+== Lesson 5: Try to break phase 3.2 ==
+
+;'''A. No Node installed'''
+: <code>sudo apt remove --purge nodejs</code> (don't really, but conceptually): the script exits 2 with <code>missing dependency 'node'</code> before doing anything. Phase 3.2 fails fast on missing deps — won't accidentally run with broken pieces.
+
+;'''B. Forgot to <code>npm install</code>'''
+:Delete <code>node_modules/</code>: the script exits 2 with <code>@hiveio/dhive not installed. Run: cd … && npm install</code>. Clear actionable error.
+
+;'''C. Empty stdin'''
+: <code>./ngate-verify.sh < /dev/null</code>: works fine, exits 0, no output. "Nothing to verify" is not an error.
+
+;'''D. Garbage stdin'''
+: <code>echo "this is not JSON" | ./ngate-verify.sh</code>: jq parsing fails inside the script's loop; the candidate is silently skipped. Stdout stays clean. The script logs an internal jq error to stderr but doesn't crash. (You can also just <code>set -e</code> off the strict-error-handling and let jq complain — both behaviours surface bad input.)
+
+;'''E. Hive RPC down'''
+:All four Hive nodes unreachable: the script can't fetch posting pubkeys, so EVERY candidate is rejected with <code>REJECT @user/domain — could not fetch posting pubkey from any Hive node</code>. Stdout has no verified output. Exit code is still 0 (no hard failure — the script ran, it just didn't find anything verifiable). Phase 3.4's "ADD-only on partial failure" rule will treat this correctly: no removals on a zero-verified-output run.
+
+;'''F. Mismatched well-known + post (the case you saw on hive-book.com)'''
+:Already happens in your real data. The well-known hive_account doesn't match the post's HIVE-ACCOUNT. Phase 3.2 catches it cleanly. Operator should re-run <code>server-sign.html</code> with the correct fields, redeploy the well-known, and the next scan will verify.
+
+;'''G. Within-scan hex collision (forgery simulation)'''
+:Hard to reproduce naturally because you don't actually have any forgers attacking you. But conceptually:
+:# Forger publishes a v4call-server post under a Hive account they control.
+:# The post claims someone else's Nostr pubkey hex.
+:# nGate's scan picks up BOTH the legit operator's post AND the forger's post.
+:# Phase 3.2's first pass spots the same hex claimed by two different hive_accounts.
+:# Both are rejected — the legit operator AND the forger.
+:# Yes, this is "harsh" to the legit operator, but the alternative (silently allow whichever appears first in the scan) is worse — that lets a forger race the legit operator's announcement.
+:# The cure: legit operator re-publishes their announce, forger doesn't, next scan has only the legit one. (Or, in stage 3.4+, persistent state remembers "first-claim-wins" across scans.)
+
+== What phase 3.2 still does NOT do ==
+
+* '''No HP / token gate.''' A verified candidate is still just "the cryptographic story checks out." It's not yet "this server has earned the right to publish on this relay." '''Phase 3.3''' handles that.
+* '''No persistent collision detection.''' If the legit operator's post ages out of the scan window (>20 most recent v4call-server posts) and only the forger's remains, phase 3.2 has no memory. '''Phase 3.4''' adds state.json with first-claim-wins-across-scans semantics.
+* '''No <code>config.toml</code> writing.''' Output is still just printed. '''Phase 3.4''' takes the verified-and-gated set and writes it.
+* '''No cron, no sidecar.''' Manual chain. '''Phase 3.5''' wraps it.
+* '''No NIP-11 relay-info publication.''' The relay doesn't yet declare "I am an nGated relay using gate config X" in its NIP-11 metadata. Possible stage 3.5+ enhancement; useful for clients that want to filter for nGated-only relays.
+
+== Lesson 6: Phase 3.3 intro + gate config ==
+
+Phase 3.3 takes the verified candidates from phase 3.2 and asks the real question: '''does this Hive account meet the economic conditions to publish on my relay?''' Two gates available, configurable independently or in combination:
+
+* '''HP gate''' — minimum staked Hive Power on the target account.
+* '''Token gate''' — minimum holding of any Hive-Engine token on the target account.
+
+Combined via OR (default — pass either) or AND (must pass both). Same shape as v4call's existing lobby-anti-spam gate (<code>LOBBY_POST_MIN_HP</code>, <code>LOBBY_POST_MIN_TOKEN</code>, <code>LOBBY_POST_GATE_MODE</code>) — operators who already understand v4call grok this instantly.
+
+;'''Important — env var placement with pipes'''
+:Bash gotcha that bites everyone the first time. This does NOT work as expected:
+: <code>NGATE_MIN_HP=3 ./ngate-scan.sh | ./ngate-verify.sh | ./ngate-gate.sh</code>
+:The env var only attaches to <code>ngate-scan.sh</code> in that command — by the time the pipe reaches the gate, the env is gone.
+:'''The right way''' — put the env vars on the command they affect:
+: <code>./ngate-scan.sh | ./ngate-verify.sh | NGATE_MIN_HP=3 ./ngate-gate.sh</code>
+:Or use <code>export</code>:
+: <code>export NGATE_MIN_HP=3 && ./ngate-scan.sh | ./ngate-verify.sh | ./ngate-gate.sh</code>
+
+;'''Configuration env vars''' (all optional, all printed at start of each run for sanity)
+:* <code>NGATE_GATE_ACCOUNT</code> — which account to gate on. <code>escrow</code> (default; recommended — gates the account that actually moves money) or <code>hive_account</code> (gates the brand-new vanity / posting account).
+:* <code>NGATE_MIN_HP</code> — minimum HP. 0 (default) = HP gate disabled. Positive number = enabled.
+:* <code>NGATE_INCLUDE_DELEGATED_HP</code> — count delegated-in HP toward the threshold. Default <code>false</code> (owned-only). Setting to <code>true</code> lets a whale rent privileges via delegation — usually a bad idea.
+:* <code>NGATE_MIN_TOKEN_SYMBOL</code> — Hive-Engine symbol like <code>CNOOBS</code>. Empty (default) = token gate disabled.
+:* <code>NGATE_MIN_TOKEN_AMOUNT</code> — minimum token amount. 0 (default).
+:* <code>NGATE_INCLUDE_STAKED_TOKEN</code> — count staked tokens toward the threshold. Default <code>true</code>.
+:* <code>NGATE_GATE_MODE</code> — <code>or</code> (default) or <code>and</code>. Only matters when both HP and token gates are enabled.
+:* <code>NGATE_DEBUG=1</code> — print extra math (HP calc, token fetch) to stderr. Off by default; useful for first runs.
+
+;'''Gate target — escrow vs hive_account'''
+:Default is <code>escrow</code>. The reasoning: the escrow account is the OPERATIONAL account that actually moves money on the operator's behalf. If the gate enforces "30 HP on escrow," it means the relay won't whitelist a server whose escrow can't afford to pay transaction RC. Vanity check the brand-new Hive account that signs the announce, you might let in someone whose escrow runs on fumes.
+:Override to <code>hive_account</code> if you specifically want to vet the announcing account itself (e.g. for token-holding tests where the hive_account is the one that bought CNOOBS).
+
+== Lesson 7: Three HP test scenarios ==
+
+These are the canonical "does the gate work?" tests. Run all three to ground yourself in expected behaviour.
+
+;'''A. No gate — sanity baseline'''
+:Confirm the gate is wired up and passes everything when no thresholds are configured.
+: <code>./nGate/scripts/ngate-scan.sh 2>/dev/null | ./nGate/scripts/ngate-verify.sh 2>/dev/null | ./nGate/scripts/ngate-gate.sh</code>
+:Expected stderr (one of the lines):
+: ngate-gate: WARN: no gates configured — every verified candidate will pass through
+:Each verified candidate should appear on stdout with <code>"gate_pass":true, "gate_passed_via":["nogate"]</code>.
+
+;'''B. Impossible threshold — confirms the gate actually filters'''
+: <code>./nGate/scripts/ngate-scan.sh 2>/dev/null | ./nGate/scripts/ngate-verify.sh 2>/dev/null | NGATE_MIN_HP=999999 ./nGate/scripts/ngate-gate.sh</code>
+:Every candidate gets <code>REJECT … gate failed (mode=or) hp=X.YYY/999999=false</code>. Stdout has zero candidates. Final summary: <code>complete — total=N passed=0 rejected=N errors=0</code>.
+
+;'''C. Realistic threshold — your real test'''
+:Set MIN_HP to a value at the edge of your test account. For example, 0.5 HP:
+: <code>./nGate/scripts/ngate-scan.sh 2>/dev/null | ./nGate/scripts/ngate-verify.sh 2>/dev/null | NGATE_MIN_HP=0.5 NGATE_DEBUG=1 ./nGate/scripts/ngate-gate.sh</code>
+:With <code>NGATE_DEBUG=1</code> you'll also see lines like:
+: ngate-gate [debug]: hive_per_vest = 0.000478123456 (fund=… shares=…)
+: ngate-gate [debug]: fetch_hp v4call-escrow → 0.000 HP (vests=0.000000)
+:These let you sanity-check the calculation. If it shows the wrong HP, the bug is upstream (Hive RPC returning weird data) — log it.
+
+;'''A real-data note from this build session'''
+:When this script was first run live against the three v4call-server posts on Hive, the result was:
+: ngate-gate: REJECT @cnoobs/call.completenoobs.com (gate→@v4call-escrow) — gate failed (mode=or) hp=0.000/0.5=false
+: ngate-gate: REJECT @v4call/v4call.com (gate→@v4call-escrow) — gate failed (mode=or) hp=0.000/0.5=false
+:Why? '''Neither account had any HP staked yet.''' This is exactly the gate doing its job — it correctly identifies that these accounts haven't put any "skin in the game" on Hive. To pass:
+:# Stake some HIVE: <code>cnoobs</code> wallet → "Power Up" → 3 HIVE → confirm via Keychain.
+:# Wait one Hive block (~3 sec) for chain propagation.
+:# Re-run the chain. <code>cnoobs</code> should now show HP > 0 and pass the gate.
+:# Power Down to test the transition back to "fail."
+:'''The gate doesn't lie''' — it fetches the truth from Hive and reports it. If your test account isn't passing, the answer is to stake (or change the gate target).
+
+== Lesson 8: Token gate test ==
+
+For now you can't easily test CNOOBS token staking (the user noted the 1000 BEE budget gate on Hive-Engine staking config), but the LIQUID token gate works today.
+
+;'''Run with a CNOOBS threshold of 0.1 — both v4call and cnoobs accounts hold more'''
+: <code>./nGate/scripts/ngate-scan.sh 2>/dev/null | ./nGate/scripts/ngate-verify.sh 2>/dev/null | NGATE_MIN_TOKEN_SYMBOL=CNOOBS NGATE_MIN_TOKEN_AMOUNT=0.1 NGATE_GATE_ACCOUNT=hive_account ./nGate/scripts/ngate-gate.sh</code>
+:Expected — both pass:
+: ngate-gate: OK @cnoobs/call.completenoobs.com (gate→@cnoobs) — passed via token CNOOBS=0.15000000
+: ngate-gate: OK @v4call/v4call.com (gate→@v4call) — passed via token CNOOBS=0.31000000
+:Real holdings discovered live during build: cnoobs has 0.15 CNOOBS, v4call has 0.31 CNOOBS.
+
+;'''Now try the same with a higher threshold'''
+: <code>… NGATE_MIN_TOKEN_AMOUNT=1 …</code>
+:Both fail — neither holds 1+ CNOOBS.
+
+;'''Combined HP + token, OR mode'''
+: <code>… NGATE_MIN_HP=0.5 NGATE_MIN_TOKEN_SYMBOL=CNOOBS NGATE_MIN_TOKEN_AMOUNT=0.1 NGATE_GATE_ACCOUNT=hive_account NGATE_GATE_MODE=or …</code>
+:Even though HP=0 fails, token=0.15 passes the 0.1 threshold, so OR-mode passes the candidate. Output shows <code>"gate_passed_via":["token"]</code>.
+
+;'''Combined HP + token, AND mode'''
+: <code>… NGATE_GATE_MODE=and …</code>
+:Now both gates must pass. With cnoobs at 0 HP, AND-mode fails even though token passes. Expected reject log shows both numbers:
+: REJECT @cnoobs/… — gate failed (mode=and) hp=0.000/0.5=false CNOOBS=0.15000000/0.1=true
+
+;'''Different Hive-Engine tokens to play with'''
+:* <code>SWAP.HIVE</code> — synthetic HIVE on Hive-Engine
+:* <code>BEE</code> — Hive-Engine's native gas token
+:* <code>SWAP.BTC</code> — wrapped Bitcoin (your v4call payment-currency test)
+:Anything in <code>https://api.hive-engine.com/rpc/contracts</code>'s <code>tokens</code> contract works. The script doesn't care; it just queries by symbol.
+
+== Lesson 9: Try to break phase 3.3 ==
+
+;'''A. Bad env vars'''
+: <code>NGATE_MIN_HP=hello ./ngate-gate.sh < /dev/null</code> → <code>NGATE_MIN_HP must be a non-negative number, got 'hello'</code>, exit 2.
+: <code>NGATE_GATE_MODE=banana ./ngate-gate.sh < /dev/null</code> → <code>NGATE_GATE_MODE must be 'or' or 'and'</code>, exit 2.
+: <code>NGATE_GATE_ACCOUNT=random ./ngate-gate.sh < /dev/null</code> → similar reject.
+:All argument validation happens BEFORE any Hive RPC calls — fail fast, no half-runs.
+
+;'''B. Empty stdin'''
+: <code>./ngate-gate.sh < /dev/null</code> → exits cleanly with <code>complete — total=0 passed=0 rejected=0 errors=0</code>. "Nothing to gate" is fine.
+
+;'''C. Hive-Engine RPC down (token gate)'''
+:Hard to reproduce naturally. If all three Hive-Engine endpoints fail for a given lookup, the candidate is rejected with <code>ERROR … token fetch failed (transient Hive-Engine RPC); not passing</code> and the run's exit code becomes '''2''' (partial fetch errors). Phase 3.4's "ADD-only on partial failure" rule keys off this exit code: a 2-exit means existing whitelist entries are preserved instead of being removed.
+
+;'''D. Account doesn't exist on Hive'''
+:If a <code>v4call-server</code> post points at a Hive account that's been renamed or doesn't exist, the script treats their HP as 0 (the account row is missing) and fails the HP gate. Token gate similarly: missing account = 0 holding.
+
+;'''E. Run with NGATE_DEBUG=1 to see the math'''
+:Reveals the intermediate values the gate is computing. Useful when "I can see the account has 5 HP but the gate says 0" — you'll see whether <code>vesting_shares</code> is being read correctly, what <code>hive_per_vest</code> is, and the multiplication.
+
+== What phase 3.3 still does NOT do ==
+
+* '''No persistence.''' Every run is a fresh fetch — no caching across runs. The next phase (3.4) introduces <code>state.json</code> for "last seen", "consecutive failures", and "first-claim-wins" semantics.
+* '''No <code>config.toml</code> writing.''' Output is still just NDJSON to stdout. Phase 3.4 takes the verified-and-gated set and writes the actual relay config.
+* '''No cron, no sidecar.''' You're running it manually. Phase 3.5 wraps it.
+* '''No combined gate balance.''' Each gate is independently checked; we don't currently support things like "passes if HP+10×CNOOBS ≥ N". KISS for stage 3 — add later if needed.
+* '''No per-relay differentiation in YAML config.''' Right now you set env vars per-run. Phase 3.5 reads them from <code>ngate.yaml</code> mounted in the sidecar so each relay can have its own gate.
+
+== Lesson 10: Phase 3.4 intro + safety rails ==
+
+Phase 3.4 is the FIRST script in nGate that actually '''writes''' to disk. With great power comes a layered set of safety rails — six of them, each protecting a different failure mode:
+
+# '''Defaults to <code>--dry-run</code>''' — the script literally cannot write to disk unless you explicitly pass <code>--apply</code>. Re-running by accident is harmless.
+# '''Defaults to <code>--no-allow-removals</code>''' — even with <code>--apply</code>, existing whitelist entries are NEVER removed unless you also pass <code>--allow-removals</code>. The cron wrapper in phase 3.5 will only set this flag when upstream had a clean run (no errors).
+# '''Atomic writes''' — every config.toml change goes through a temp file, sanity-checked, then renamed into place. There is no window where the file is half-written.
+# '''Marker-protected zone''' — the script only modifies content between two literal comment markers in <code>config.toml</code>. Everything else (other sections, your hand-edited tweaks) stays untouched.
+# '''Restart cap''' — caps relay restarts to <code>NGATE_MAX_RESTARTS_PER_DAY</code> (default 6). If hit, the script refuses to restart, logs an error, and waits for the next cycle.
+# '''Sanity bound''' — if zero candidates passed the gate AND every non-seed entry would be removed, the script REFUSES to apply. This catches "looks like an upstream outage" scenarios that <code>--allow-removals</code> alone can't.
+
+;'''Three input files'''
+:* <code>config.toml</code> — your relay's existing config. nGate writes between BEGIN/END markers only.
+:* <code>seed.toml</code> — operator-managed always-allowed list. One hex pubkey per line, # for comments, never auto-removed.
+:* <code>state.json</code> — machine-managed memory: per-key first-seen timestamp, consecutive-misses counter, restart history. Created on first <code>--apply</code>. Inspectable with <code>jq</code>.
+
+;'''Bootstrap step''' (one-time, before first apply)
+:Your existing <code>config.toml</code> from stage 1 doesn't have BEGIN/END markers yet. Run:
+: <code>./ngate-apply.sh --bootstrap</code>
+:This wraps your existing <code>[authorization]</code> section in:
+
+  # === BEGIN NGATE-MANAGED — DO NOT EDIT BY HAND ===
+  [authorization]
+  pubkey_whitelist = [
+    ...your existing entries...
+  ]
+  # === END NGATE-MANAGED ===
+
+:From this point forward, '''don't hand-edit between those markers'''. Use <code>seed.toml</code> for keys you want always-allowed.
+
+;'''Four exit codes you'll see'''
+:* <code>0</code> — success (whether dry-run or apply)
+:* <code>1</code> — config.toml missing or markers absent (run <code>--bootstrap</code>)
+:* <code>3</code> — restart cap hit (config.toml was NOT modified; will retry next cycle)
+:* <code>4</code> — sanity bound triggered or rewrite would have broken structure (config.toml left untouched)
+
+== Lesson 11: Sandbox dry-run (no relay touched) ==
+
+Run phase 3.4 against a fixture <code>config.toml</code> in <code>/tmp</code> first, so you can break it freely without risking your live relays.
+
+;Step 1 — make the sandbox
+: <code>mkdir -p /tmp/ngate-test && cd /tmp/ngate-test</code>
+:Create a fake <code>config.toml</code>:
+
+  cat > config.toml <<'EOF'
+  [info]
+  name = "test-relay"
+
+  [authorization]
+  pubkey_whitelist = [
+    "1111111111111111111111111111111111111111111111111111111111111111",
+    "2222222222222222222222222222222222222222222222222222222222222222",
+  ]
+
+  [retention]
+  EOF
+
+:Empty seed file:
+: <code>touch seed.toml</code>
+
+;Step 2 — bootstrap (wrap [authorization] in markers)
+: <code>NGATE_CONFIG_PATH=/tmp/ngate-test/config.toml \\</code>
+: <code>NGATE_SEED_PATH=/tmp/ngate-test/seed.toml \\</code>
+: <code>NGATE_STATE_PATH=/tmp/ngate-test/state.json \\</code>
+: <code>~/CAI/v4call/nGate/scripts/ngate-apply.sh --bootstrap</code>
+:Inspect: <code>cat /tmp/ngate-test/config.toml</code>. You'll see BEGIN/END markers wrapping your <code>[authorization]</code>.
+
+;Step 3 — dry-run with real Hive candidates
+:From the v4call repo root:
+
+  cd ~/CAI/v4call
+  NGATE_CONFIG_PATH=/tmp/ngate-test/config.toml \
+  NGATE_SEED_PATH=/tmp/ngate-test/seed.toml \
+  NGATE_STATE_PATH=/tmp/ngate-test/state.json \
+  NGATE_RESTART_CMD="echo '[mock-restart]'" \
+  bash -c "./nGate/scripts/ngate-scan.sh 2>/dev/null \
+    | ./nGate/scripts/ngate-verify.sh 2>/dev/null \
+    | NGATE_GATE_ACCOUNT=hive_account NGATE_MIN_TOKEN_SYMBOL=CNOOBS NGATE_MIN_TOKEN_AMOUNT=0.1 \
+      ./nGate/scripts/ngate-gate.sh 2>/dev/null \
+    | ./nGate/scripts/ngate-apply.sh"
+
+:'''Notice''': the chain ends with <code>ngate-apply.sh</code> with NO flags — that's <code>--dry-run</code> default.
+:Expected stderr:
+
+  ngate-apply: seed: 0 pubkey(s) loaded from /tmp/ngate-test/seed.toml
+  ngate-apply: current: 2 pubkey(s) in /tmp/ngate-test/config.toml whitelist
+  ngate-apply: stdin: 2 candidate(s) passed gate this run
+  ngate-apply: state: starting fresh (no /tmp/ngate-test/state.json yet)
+  ngate-apply:   ADD       c191dccd…
+  ngate-apply:   ADD       4e06d691…
+  ngate-apply:   TOLERATE  1111… (missed 1/3)
+  ngate-apply:   TOLERATE  2222… (missed 1/3)
+  ngate-apply: summary: add=2 keep=0 tolerate=2 remove=0 seed=0 → new whitelist size = 4
+  ngate-apply: DRY RUN — no files changed. Add --apply to write.
+
+:'''Notice''': the two real Hive candidates (cnoobs + v4call) are flagged as <code>ADD</code>; the two fake fixture entries (<code>1111</code> + <code>2222</code>) are <code>TOLERATE</code> — they're not passing the gate this run, but their consecutive-miss count is only 1/3 so they're kept.
+:Diff <code>config.toml</code> against itself: no changes. Dry-run did its job.
+
+== Lesson 12: Sandbox apply + state.json ==
+
+Same chain as lesson 11, but with <code>--apply</code>:
+
+  ./nGate/scripts/ngate-apply.sh --apply
+
+After this run:
+* <code>config.toml</code>'s BEGIN/END block now has 4 hex entries (the original 2 + the 2 new from gate) sorted alphabetically.
+* <code>state.json</code> exists. Inspect: <code>jq . /tmp/ngate-test/state.json</code> — you'll see per-candidate first_seen, last_seen, consecutive_misses (0 for the new ones, 1 for the tolerated ones), and the run/apply timestamps.
+* Mock-restart fired ("[mock-restart]" printed once).
+
+Try running again immediately — should print "no changes — config.toml left untouched, no restart needed." The script is idempotent.
+
+== Lesson 13: Miss tolerance + safety bound ==
+
+Now simulate "every operator went offline" by piping nothing into <code>ngate-apply.sh</code>:
+
+;'''Run 1, 2, 3, 4 — empty input, no <code>--allow-removals</code>'''
+
+  for i in 1 2 3 4; do
+    echo "--- run $i ---"
+    NGATE_CONFIG_PATH=/tmp/ngate-test/config.toml \
+    NGATE_SEED_PATH=/tmp/ngate-test/seed.toml \
+    NGATE_STATE_PATH=/tmp/ngate-test/state.json \
+    NGATE_RESTART_CMD="echo '[mock-restart]'" \
+    ./nGate/scripts/ngate-apply.sh --apply < /dev/null 2>&1 | grep -E "TOLERATE|REMOVE|summary"
+  done
+
+:Expected: every entry's miss count climbs each run (1/3, 2/3, 3/3, 4/3, …) but '''nothing is removed''' because <code>--allow-removals</code> is off. This is the "graceful tolerance" rail.
+
+;'''Run with <code>--allow-removals</code> AND empty input → sanity bound triggers'''
+
+  ./nGate/scripts/ngate-apply.sh --apply --allow-removals < /dev/null
+
+:Expected stderr:
+: <code>ngate-apply: ERROR: refusing to apply — zero candidates passed gate AND every non-seed entry would be removed</code>
+:Exit code 4. <code>config.toml</code> NOT modified. The sanity bound caught what would have been a "blow away the whole whitelist on a bad upstream day" event.
+
+;'''Now simulate "real Hive comes back" — pipe real candidates in WITH <code>--allow-removals</code>'''
+
+  bash -c "./nGate/scripts/ngate-scan.sh 2>/dev/null \
+    | ./nGate/scripts/ngate-verify.sh 2>/dev/null \
+    | NGATE_GATE_ACCOUNT=hive_account NGATE_MIN_TOKEN_SYMBOL=CNOOBS NGATE_MIN_TOKEN_AMOUNT=0.1 \
+      ./nGate/scripts/ngate-gate.sh 2>/dev/null \
+    | NGATE_CONFIG_PATH=/tmp/ngate-test/config.toml \
+      NGATE_SEED_PATH=/tmp/ngate-test/seed.toml \
+      NGATE_STATE_PATH=/tmp/ngate-test/state.json \
+      NGATE_RESTART_CMD=\"echo '[mock-restart]'\" \
+      ./nGate/scripts/ngate-apply.sh --apply --allow-removals"
+
+:Now: real candidates pass (2 KEEP since they were already added in lesson 12); fake <code>1111</code> + <code>2222</code> have miss count >= 3 → '''REMOVE'''. Final whitelist has 2 entries.
+
+;'''Bonus — add a seed entry'''
+
+  echo "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef" > /tmp/ngate-test/seed.toml
+
+:Re-run the chain. Now <code>summary: add=0 keep=2 tolerate=0 remove=0 seed=1 → new whitelist size = 3</code>. The seed entry is always-included regardless of upstream.
+
+== Lesson 14: Real relay bootstrap (when ready) ==
+
+When you're confident from the sandbox lessons, deploy nGate to a real relay box. SSH to <code>nostr.v4call.com</code> (or <code>nostr.hive-book.com</code>) and:
+
+# '''Install dependencies''' (if missing): <code>apt install -y nodejs npm jq</code>
+# '''Copy the scripts''' to <code>/opt/nostr-relay/scripts/</code> (clone the v4call repo there, or scp the <code>nGate/scripts/</code> folder).
+# '''Run npm install''': <code>cd /opt/nostr-relay/scripts && npm install</code> (for the dhive crypto helper).
+# '''Bootstrap''' the existing config:
+#: <code>./scripts/ngate-apply.sh --bootstrap</code>
+#: This wraps <code>[authorization]</code> in BEGIN/END markers. Inspect <code>cat config.toml</code> — verify your existing whitelist is still there, just inside the markers.
+# '''Create seed.toml''' with your operator's own hex pubkey (the one currently in pubkey_whitelist) so you don't lock yourself out:
+#: <code>echo "YOUR_OWN_HEX_PUBKEY" > seed.toml</code>
+# '''Dry-run the full chain''' to confirm it picks up your three v4call-server posts:
+#: <code>./scripts/ngate-scan.sh | ./scripts/ngate-verify.sh | NGATE_MIN_HP=3 ./scripts/ngate-gate.sh | ./scripts/ngate-apply.sh</code>
+# '''Apply''' when the dry-run output looks right:
+#: <code>... | ./scripts/ngate-apply.sh --apply</code>
+# '''Verify the relay still works''': <code>nak req -k 1 -a YOUR_HEX wss://nostr.v4call.com</code> from your laptop. If you can fetch events, the restart succeeded.
+
+That's the real-deployment flow. Phase 3.5 will turn this into a cron-driven sidecar so you don't have to run it manually.
+
+== What phase 3.4 still does NOT do ==
+
+* '''No automatic scheduling.''' You're still typing the commands by hand. Phase 3.5 (the sidecar) wires this into a self-paced loop with the <code>scan_interval_seconds</code> from your YAML config.
+* '''No upstream-exit-code-aware <code>--allow-removals</code>.''' Phase 3.4 doesn't see whether ngate-gate exited 0 (clean) or 2 (had errors) — pipes don't propagate that. You manually pass <code>--allow-removals</code> when you trust the run. Phase 3.5's sidecar wrapper inspects the upstream exit code via <code>PIPESTATUS</code> and toggles the flag automatically.
+* '''No multi-relay coordination.''' Each relay's nGate runs independently. They converge to the same whitelist within one cycle but don't gossip with each other.
+* '''No NIP-11 publication of "I am an nGated relay".''' A nice-to-have for clients filtering for nGated relays. Stage 3.6+ enhancement.
+* '''No live policy plugin.''' Restart-on-update is a real but infrequent disruption. Stage 4 / strfry migration removes this.
+
+== Lesson 15: ngate.yaml + ngate-sync intro ==
+
+Phase 3.5 brings everything from phases 3.1–3.4 together into a single sidecar Docker container that:
+
+* Reads a YAML config file ONCE at startup (operator-friendly schema).
+* Translates YAML to the env vars the four scripts already understand.
+* Runs the full chain (scan → verify → gate → apply) on a self-paced loop.
+* Inspects PIPESTATUS after every cycle — automatically passes <code>--allow-removals</code> to ngate-apply only when scan + verify + gate all exited 0.
+* Logs every cycle with ISO timestamps and instance name to a file you can <code>tail</code>.
+* Restarts the sibling nostr-rs-relay container when config.toml changes.
+
+;'''The new files in the nGate/ folder'''
+:* <code>ngate.yaml.example</code> — annotated config template. Copy to <code>ngate.yaml</code> on each relay box.
+:* <code>scripts/ngate-sync.sh</code> — the loop wrapper.
+:* <code>scripts/ngate-status.sh</code> — read-only operator helper: "what's nGate doing?".
+:* <code>scripts/Dockerfile</code> — sidecar image build recipe.
+:* <code>docker-compose.example.yml</code> — full 3-service stack (relay + caddy + ngate-sync).
+
+;'''YAML config — the operator-friendly schema'''
+:Stage 3.5's <code>ngate.yaml</code> is a single source of truth for everything you previously passed as env vars on the command line. Open <code>nGate/ngate.yaml.example</code> in an editor — every field is commented inline. Key things to set:
+:* <code>instance_name</code> — shown in logs, helps when running multiple relays.
+:* <code>scan_interval_seconds</code> — how often the chain runs (default 21600 = 6h).
+:* <code>gate.*</code> — the same fields you tested in phase 3.3 (account, min_hp, token symbol/amount, mode).
+:* <code>restart_command</code> — defaults to <code>docker restart nostr-relay</code>; works as long as your nostr-rs-relay container is named <code>nostr-relay</code>.
+
+;'''New tool: <code>yq</code>'''
+:Phase 3.5 uses <code>yq</code> to parse YAML in bash. Two implementations are out there and both work with this script:
+:* '''mikefarah/yq''' (Go, single binary, faster). The Dockerfile installs this version.
+:* '''kislyuk/yq''' (Python, wraps jq). Available as <code>apt install yq</code> on Ubuntu.
+:If you're testing the scripts on your laptop: <code>sudo apt install -y yq</code>.
+:If you'll only run the sidecar: nothing to install on the host — yq lives inside the container.
+
+== Lesson 16: Sandbox run with --once ==
+
+Before deploying the sidecar to a relay box, run <code>ngate-sync</code> in <code>--once</code> mode against the sandbox you set up in lessons 11–13. This validates the YAML parsing + loop + PIPESTATUS-aware --allow-removals without ever touching docker-compose.
+
+;Step 1 — make ngate.yaml for the sandbox
+:From the repo root:
+
+  cat > /tmp/ngate-test/ngate.yaml <<'EOF'
+  instance_name: sandbox-test
+  hive_nodes:
+    - https://api.hive.blog
+  scan_interval_seconds: 60
+  gate:
+    account: hive_account
+    min_hp: 0
+    min_token_symbol: CNOOBS
+    min_token_amount: 0.1
+    mode: or
+  max_consecutive_failures: 3
+  max_restarts_per_day: 6
+  verbose: false
+  restart_command: echo '[mock-restart]'
+  paths:
+    config_toml: /tmp/ngate-test/config.toml
+    seed_toml:   /tmp/ngate-test/seed.toml
+    state_json:  /tmp/ngate-test/state.json
+    log_file:    /tmp/ngate-test/ngate-sync.log
+  EOF
+
+;Step 2 — run once
+: <code>NGATE_YAML=/tmp/ngate-test/ngate.yaml ~/CAI/nGate/scripts/ngate-sync.sh --once</code>
+:Expected output:
+
+  [2026-05-11T…Z] [sandbox-test] starting ngate-sync instance=sandbox-test interval=60s gate=hive_account/min_hp=0/token=CNOOBS>=0.1/mode=or delegated=false
+  [2026-05-11T…Z] [sandbox-test] ─── cycle starting ───
+  [2026-05-11T…Z] [sandbox-test] ─── cycle complete (apply ok) ───
+  [2026-05-11T…Z] [sandbox-test] --once specified — exiting
+
+;Step 3 — inspect the log file
+: <code>tail /tmp/ngate-test/ngate-sync.log</code>
+:You'll see the full per-cycle trace (every <code>ngate-*</code> stderr line is captured in the log file too, prefixed with the ISO timestamp + instance name).
+
+;Step 4 — drop the YAML file or break a field
+:Rename <code>/tmp/ngate-test/ngate.yaml</code> to break the path: should fail with <code>config not found</code>, exit 2.
+:Set <code>gate.account</code> to <code>banana</code>: ngate-gate's own validation catches it during the cycle and rejects the config — visible in the log.
+
+;'''💡 Why a sandbox first''' — running <code>ngate-sync --once</code> with <code>restart_command: echo</code> means even if the script has a bug, nothing happens to your real relay. It's the same defence-in-depth pattern as phase 3.4's <code>--dry-run</code> default: never let an untested script touch the live thing.
+
+== Lesson 17: Deploy the Docker sidecar ==
+
+When you're confident from the sandbox run, deploy the sidecar to one of your relay boxes (start with one, prove it, then do the others).
+
+;Step 1 — get the files onto the relay box
+:SSH to <code>nostr.v4call.com</code> (or wherever). Either clone the nGate repo to <code>/opt/nostr-relay/</code> or scp the relevant files in:
+
+  cd /opt/nostr-relay
+  # Option A: clone the repo
+  git clone <ngate-repo-url> /tmp/ngate-src
+  cp -r /tmp/ngate-src/scripts ./scripts
+  cp /tmp/ngate-src/ngate.yaml.example ./ngate.yaml
+  cp /tmp/ngate-src/docker-compose.example.yml /tmp/new-compose.yml
+
+;Step 2 — customise <code>ngate.yaml</code>
+:Edit with your operator-specific values:
+: <code>vi /opt/nostr-relay/ngate.yaml</code>
+:Most operators only need to change <code>instance_name</code>, <code>scan_interval_seconds</code> (if not the default), and <code>gate</code> thresholds. The <code>paths.*</code> fields default to <code>/app/...</code> which match the bind-mounts in the sidecar.
+
+;Step 3 — create <code>seed.toml</code> with your own pubkey
+:'''Critical''' — if you forget this step and apply with --allow-removals, your own operator key could get removed from the whitelist and lock you out. Put a one-line entry in:
+
+  echo "YOUR_OWN_NOSTR_HEX_PUBKEY" > /opt/nostr-relay/seed.toml
+
+:Use the hex form from <code>nostr-gen.html</code> — the same one that's already in <code>config.toml</code>'s <code>pubkey_whitelist</code>.
+
+;Step 4 — bootstrap config.toml
+: <code>./scripts/ngate-apply.sh --bootstrap</code>
+:Wraps your existing <code>[authorization]</code> section in BEGIN/END markers. Inspect: <code>cat config.toml</code> — verify the markers are there and the existing pubkey entries are inside.
+
+;Step 5 — merge the sidecar into your existing docker-compose.yml
+:Open <code>/tmp/new-compose.yml</code> and your existing <code>/opt/nostr-relay/docker-compose.yml</code> side-by-side. Add the <code>ngate-sync</code> service block from the example to your existing file. Don't replace the file — your existing relay + caddy services are already correct.
+
+;Step 6 — initialise state.json
+: <code>echo '{"last_run":"","last_apply":"","restart_log":[],"candidates":{}}' > /opt/nostr-relay/state.json</code>
+:(The sidecar will create one automatically on first run if missing, but pre-creating it means the bind-mount works on the very first start.)
+
+;Step 7 — build the sidecar image
+: <code>cd /opt/nostr-relay && docker compose build ngate-sync</code>
+:First build downloads node:20-alpine + yq + docker-cli. Subsequent builds are fast.
+
+;Step 8 — start it
+: <code>docker compose up -d ngate-sync</code>
+:Watch the first cycle:
+: <code>docker compose logs -f ngate-sync</code>
+:You should see the YAML-config summary line, then a cycle start, then per-script log lines, then "cycle complete (apply ok)". Sleep duration is whatever you set in <code>scan_interval_seconds</code>.
+
+;Step 9 — verify the relay still works
+:From your laptop:
+: <code>nak req -k 1 -a YOUR_HEX wss://nostr.v4call.com</code>
+:If it fetches events, the sidecar didn't break anything.
+
+;'''💡 Permissions reminder''' — the same UID-mismatch gotcha from stage 1 applies here. <code>state.json</code> and <code>config.toml</code> on the host need to be writable by the user the sidecar container runs as. If you see "permission denied" errors in the logs, the quickest unblock is <code>chmod 666 state.json config.toml</code> (acceptable for a single-purpose box).
+
+== Lesson 18: Monitoring with ngate-status ==
+
+The sidecar logs everything to <code>/app/ngate-sync.log</code> inside the container (which is bind-mounted from the host's <code>./ngate-sync.log</code>). For a quick snapshot of state, use the new helper:
+
+  docker compose exec ngate-sync /app/scripts/ngate-status.sh
+
+Or from the host with env vars:
+
+  NGATE_YAML=/opt/nostr-relay/ngate.yaml \
+  NGATE_STATE_PATH=/opt/nostr-relay/state.json \
+  NGATE_CONFIG_PATH=/opt/nostr-relay/config.toml \
+  NGATE_SEED_PATH=/opt/nostr-relay/seed.toml \
+  ~/CAI/nGate/scripts/ngate-status.sh
+
+Output (the boxed summary):
+
+  ╔═══════════════════════════════════════════════════════════════════╗
+  ║  nGate status — instance: nostr-v4call                            ║
+  ╚═══════════════════════════════════════════════════════════════════╝
+
+    Last run:        2026-05-11T14:29:24Z
+    Last apply:      2026-05-11T08:00:00Z
+    Restarts (all):  2
+    Restarts (24h):  1
+    Tracked keys:    3
+
+    Seed list (/opt/nostr-relay/seed.toml):
+      1 operator-managed pubkey(s) (always allowed)
+
+    Active whitelist (/opt/nostr-relay/config.toml):
+      3 pubkey(s) in nGate-managed block
+
+    Per-key state (top 10 by consecutive_misses):
+      0 miss(es)  discove  c191dccd8370bcae…  first_seen=2026-05-10T…
+      0 miss(es)  seed     deadbeefdeadbeef…  first_seen=2026-05-10T…
+      0 miss(es)  discove  4e06d691682de81a…  first_seen=2026-05-10T…
+
+;'''Use this output to spot trouble before it bites''':
+:* <code>Restarts (24h)</code> at the cap (default 6) = nGate is struggling — check the log for repeated errors.
+:* <code>Tracked keys</code> growing unboundedly = lots of candidates churn in/out — set <code>verbose: true</code> and see why.
+:* <code>Last apply</code> stale (> scan_interval × 2) = sidecar crashed or hung — check container status.
+
+;'''Logs you can <code>tail</code>'''
+:* <code>docker compose logs -f ngate-sync</code> — live stream.
+:* <code>tail -F /opt/nostr-relay/ngate-sync.log</code> — bind-mounted host file (same content; useful when docker-compose isn't handy).
+
+== What phase 3.5 still does NOT do ==
+
+* '''No HTTP health endpoint.''' If you want Prometheus/Grafana monitoring you'll need to parse state.json yourself. Adding a tiny built-in JSON-over-HTTP server is a stage 3.6 nice-to-have.
+* '''No multi-instance coordination.''' Each relay's sidecar runs independently. They converge to the same whitelist via Hive, not via direct gossip.
+* '''No hot YAML reload.''' Change <code>ngate.yaml</code> → <code>docker compose restart ngate-sync</code> to pick it up. (Hot reload would require a SIGHUP handler — easy to add, deferred until needed.)
+* '''No NIP-11 metadata publication''' announcing "I am an nGated relay using gate config X". Clients filtering by relay capability would need this. Stage 3.6+.
+* '''No live policy plugin.''' Restart-on-write is real but infrequent. Stage 4 (strfry migration) removes restarts entirely.
+* '''No graceful failover when Hive RPC is sustained-down.''' Per the ADD-only rule, the whitelist won't be nuked, but the sidecar will keep retrying every cycle. Stage 4 could include a tighter backoff strategy.
+
+== Wisdom drops ==
+
+;'''Read-only first, write second'''
+:Phase 3.1 is read-only on purpose. So is phase 3.2 and phase 3.3. Only phase 3.4 writes anything, and even then it defaults to <code>--dry-run</code>. The structure means you can run any of the early phases as often as you want — including in production — without changing any state. This is a non-negotiable design choice for stage 3, and worth carrying forward to stage 4.
+
+;'''Pure pipes'''
+:Each phase reads stdin (or no input) and writes stdout. Errors go to stderr. The script chain is <code>./ngate-scan.sh | ./ngate-verify.sh | ./ngate-gate.sh | ./ngate-apply.sh --dry-run</code>. You can short-circuit any phase by piping its output through <code>head</code>, <code>jq</code>, <code>tee</code> for inspection. Composable Unix tooling, no shared state, no surprise side effects.
+
+;'''Diagnostic logging is non-negotiable'''
+:v4call's v0.12 fix added explicit logging to <code>hivePost</code> after every HTTP/JSON-RPC failure was being silently swallowed. nGate's <code>ngate-scan.sh</code> follows the same pattern from day one — every Hive node failure prints the actual error, not just "tried, didn't work." If you ever modify the script or write phase 3.2+ yourself, '''keep the log lines'''. A silent zero-result is the worst kind of bug.
+
+;'''ADD-only on partial failure (preview from phase 3.4)'''
+:Future phases use this rule: if Hive RPC fails, well-known fetch fails, or any intermediate step misbehaves, the cron run can ONLY add new entries to the whitelist. Removals require a clean successful scan with no errors. This means a transient Hive outage can't kick legitimate operators off your relay — at worst it delays new additions until next cycle.
+
+;'''The seed list is the operator's escape hatch'''
+:When phase 3.5 ships, your relay's <code>seed.toml</code> always-allows whatever pubkeys you list. Hand-managed; nGate never modifies it. Use it for: (a) your own operator key during bootstrap before your own announce post is verified, (b) trusted federation peers who failed gating for an unrelated reason, (c) keys you want to allow regardless of any future config changes. The seed list overrides the gate but does NOT override the bans (planned for stage 3.6+).
+
+;'''YAML for human config, JSON for machine state'''
+:<code>ngate.yaml</code> is operator-edited (gate thresholds, scan interval, etc.). <code>ngate-state.json</code> is machine-managed (last scan time, per-candidate failure counts, current whitelist diff). Two file formats by purpose, not by convention. <code>jq</code> reads both fine; humans only edit YAML.
+
+;'''Convergence is not synchronisation'''
+:The two relays' whitelists '''converge''' to the same set as they each scan Hive independently. They are not '''synchronised''' — there's no message between relays. If you need one relay's whitelist to differ from another's (different gate thresholds), just run them with different configs. The architecture supports this trivially.
+
+== What's next ==
+
+Stage 3 is '''complete''' as a learning project. You've got:
+
+* '''Five working bash scripts''' covering discovery → verification → gating → application → sync.
+* '''A Docker sidecar''' that runs the chain on a self-paced loop alongside relay + Caddy.
+* '''A YAML config''' that's a single source of truth for everything an operator configures.
+* '''A status helper''' so you can see what nGate is doing at a glance.
+* '''Six safety rails''' so the script can't accidentally nuke your relay's whitelist on a bad day.
+* '''Live Hive data validation''' — every phase has been tested against real announce posts on the chain.
+
+After phase 3.5 lands on both your relays and you've watched a few real cycles run end-to-end, here are the natural next moves (in rough order):
+
+;'''Stage 3.6 — small refinements''' (1–2 sessions each)
+:* HTTP health endpoint for Prometheus monitoring.
+:* SIGHUP-driven YAML reload without container restart.
+:* NIP-11 relay-info publication ("I am an nGated relay").
+:* Per-relay differentiated config (different gate thresholds on different relays).
+:* "Rejection log" Nostr events — nGate publishes its own kind-30000-something explaining what it rejected. Transparency layer.
+
+;'''Stage 4 — strfry migration'''
+:nostr-rs-relay + cron-rewriter is the right ''first'' architecture; strfry + live policy plugin is the architectural endgame. Stage 4 ports the gate logic from "rewrite config.toml every N hours" to "strfry's write-policy plugin checks every incoming EVENT against a live in-memory whitelist that updates immediately." No more restarts. Real-time gate transitions. The nGate scripts you've built carry over almost unchanged — only the apply phase swaps "rewrite config.toml + restart" for "talk to strfry's policy daemon socket."
+
+;'''Stage 5 — user-tier relays''' (separate infrastructure)
+:Once federation discovery is solid, the same nGate architecture can run a SECOND relay tier for end users: rate-editor.html publishes user-level <code>NOSTR-PUBKEY-HEX</code> in v4call-rates posts; nGate scans those, applies a user-level gate (different thresholds, different account targets), maintains a separate user whitelist. Server-tier and user-tier relays stay separate (different trust models, different operator decisions).
+
+;'''Stage 6+ — v4call integration'''
+:Eventually v4call.server reads nGate-published Nostr events as its primary federation discovery channel (latency 30s instead of 2h), with the Hive announce posts remaining as the cryptographic ground truth. Per the existing NOSTR-DESIGN.md plan.
+
+;'''Real-world followups still worth knocking off''' before declaring stage 3 done:
+* '''Fix the hive-book.com well-known mismatch''' — re-run server-sign.html with HIVE ACCOUNT = <code>hive-book</code> (no .com), redeploy, re-announce.
+* '''Run lessons 16–17 sandbox + sidecar deploy on ONE relay first''' (suggest nostr.v4call.com since v4call account is your active test). Watch for 24h. Then deploy to nostr.hive-book.com.
+* '''Stake some HP on each escrow account''' (or set NGATE_GATE_ACCOUNT=hive_account in ngate.yaml) so the default gate is meaningful.
+
+Stage 3's wiki is now feature-complete. The natural next thing is letting it run in production on your two relays for a week or two — watching the logs, fixing edge cases as they appear, learning what an "always-on Nostr-discovery layer" actually feels like.
+
+''The mission of stage 3 — "let nGate build the relay whitelist automatically from Hive instead of by hand" — is done. Time to live with it for a while before deciding what's worth building next.''

@@ -1,0 +1,82 @@
+# ─────────────────────────────────────────────────────────────────────
+# nGate configuration — one instance per relay
+# ─────────────────────────────────────────────────────────────────────
+# Copy this to ngate.yaml on each relay box and customise.
+# Read once at sidecar startup; reload requires `docker compose restart ngate-sync`.
+
+# Human-friendly identifier for this nGate instance (shown in logs)
+instance_name: nostr-relay
+
+# ── Hive RPC nodes (multi-node fallback) ─────────────────────────────
+# Tried in order; first valid response wins. Reused for both discovery
+# (v4call-server post scan) and balance lookups (HP / token).
+hive_nodes:
+  - https://api.hive.blog
+  - https://api.deathwing.me
+  - https://hive-api.arcange.eu
+  - https://api.openhive.network
+
+# ── Cycle interval ────────────────────────────────────────────────────
+# How often the full chain (scan → verify → gate → apply) runs.
+# 21600 = 6 hours. Lower = faster discovery, more Hive RC consumed.
+scan_interval_seconds: 21600
+
+# ── Gate config ───────────────────────────────────────────────────────
+# All fields default-off when blank/zero. Multiple gates combine via `mode`.
+gate:
+  # Which Hive account on each candidate post to gate on:
+  #   escrow       — recommended; operational solvency check
+  #   hive_account — gate the announce-signing account instead
+  account: escrow
+
+  # Hive Power (HP) gate — minimum staked HP to qualify.
+  # 0 = HP gate disabled.
+  min_hp: 3
+
+  # Count received_vesting_shares (delegated-in HP) toward the threshold?
+  # Default false (owned-only) so a whale can't rent privileges via delegation.
+  include_delegated_hp: false
+
+  # Hive-Engine token gate — leave symbol blank to disable.
+  min_token_symbol: ''
+  min_token_amount: 0
+
+  # Count staked tokens toward the threshold (vs. liquid balance only)?
+  include_staked_token: true
+
+  # Combination mode when BOTH HP and token gates are set:
+  #   or  — pass either → in (default)
+  #   and — must pass both
+  mode: or
+
+# ── Removal tolerance ────────────────────────────────────────────────
+# How many consecutive cycles a key must be MISSING before becoming
+# eligible for removal. With scan_interval=21600 and value=3, an
+# entry must be absent for ~18 hours before nGate removes it.
+max_consecutive_failures: 3
+
+# ── Restart safety cap ───────────────────────────────────────────────
+# Cap on relay restarts per 24h. Prevents a stuck diff calculation from
+# restart-looping the relay forever. config.toml is still updated on each
+# cycle — only the actual `restart` is capped.
+max_restarts_per_day: 6
+
+# ── Verbose logging ──────────────────────────────────────────────────
+# false = only failures/changes; true = also per-success + per-cycle traces
+verbose: false
+
+# ── Relay restart command ────────────────────────────────────────────
+# Run from inside the sidecar container; needs docker.sock mounted in.
+# Default uses the docker CLI directly (simpler than `docker compose`).
+# The container name must match the relay's `container_name` in
+# docker-compose.yml.
+restart_command: docker restart nostr-relay
+
+# ── Paths inside the sidecar ─────────────────────────────────────────
+# These match the bind-mounts in docker-compose.yml. Change both sides
+# together if you customise.
+paths:
+  config_toml: /app/config.toml
+  seed_toml:   /app/seed.toml
+  state_json:  /app/state.json
+  log_file:    /app/ngate-sync.log

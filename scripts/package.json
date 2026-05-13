@@ -1,0 +1,11 @@
+{
+  "name": "ngate-scripts",
+  "version": "0.2.0",
+  "description": "nGate helper scripts — bash + tiny Node helpers for Hive + Nostr crypto",
+  "private": true,
+  "license": "MIT",
+  "dependencies": {
+    "@hiveio/dhive": "^1.3.2",
+    "nostr-tools": "^2.7.2"
+  }
+}

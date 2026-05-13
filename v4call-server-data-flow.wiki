@@ -1,0 +1,383 @@
+{{:LICENCE_HEADER_MIT}}
+
+
+= v4call Server Data Flow — Sign, Announce, Verify, Gate — A Noob Reference =
+
+From CompleteNoobs
+
+A clear-cut reference for which value goes in which field across <code>server-sign.html</code>, <code>server-announce.html</code>, the <code>/.well-known/v4call-server.json</code> file, the Hive announce post, and the four nGate scripts. Use this when you're not 100% sure what to type into a form, or when nGate-verify gives you an error and you don't know which value caused it.
+
+This doc complements [[Nostr_Relay_With_a_3-Key_Whitelist|stage 1]], [[Nostr_Hands-On|stage 2]], and [[NGate_—_Auto-Whitelist_a_Nostr_Relay|stage 3]] — it's not a phase, it's a "wait, I'm confused, what's what?" reference you can flip to any time.
+
+== The single biggest source of confusion: '''3 different "accounts"''' ==
+
+These are three '''separate''' things. They might happen to share names. They are not the same.
+
+{| class="wikitable"
+! Thing !! Example !! What it is !! Where it lives
+|-
+| '''HIVE ACCOUNT''' || <code>cnoobs</code> || A Hive blockchain account. Has a posting key, an active key, and an owner key. Signs the announce post. || On Hive (chain). Resolved by name lookup.
+|-
+| '''ESCROW ACCOUNT''' || <code>cnoobs-escrow</code> || ANOTHER Hive blockchain account, used by v4call-server to hold caller funds during paid calls. Its active key must be in <code>V4CALL_ESCROW_KEY</code> on the v4call server. Default nGate gate target. || On Hive (chain). Different from the HIVE ACCOUNT above. Could be the same account, but usually isn't (operational separation).
+|-
+| '''DOMAIN''' || <code>call.completenoobs.com</code> || An '''internet hostname'''. Has DNS records. Hosts your v4call server's HTTPS endpoint AND the <code>.well-known/v4call-server.json</code> file. || In DNS. Has nothing to do with Hive — domains are not blockchain accounts.
+|}
+
+'''Common confusion patterns''' from real test sessions:
+* Putting <code>call.completenoobs.com</code> (a domain) into the HIVE ACCOUNT field. Hive accounts don't have dots-and-tlds; <code>call.completenoobs.com</code> is the DOMAIN field.
+* Putting <code>hive-book.com</code> (the domain) into the HIVE ACCOUNT field, signing it, and ending up with a well-known that says <code>"hive_account": "hive-book.com"</code>. nGate-verify catches it and rejects.
+* Staking HP on <code>v4call</code> (the announcing HIVE ACCOUNT) when the gate is checking <code>v4call-escrow</code> (the escrow). Staking on the wrong account ≠ staking.
+
+== The data flow (what goes where) ==
+
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │                            YOU (operator)                                │
+ │                Decide your 3 accounts + your domain first                │
+ └────────────────────────────┬─────────────────────────────────────────────┘
+                              │
+                              ▼
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │  Step 1 — server-sign.html                                               │
+ │                                                                          │
+ │  You fill in the IDENTITY card and SERVER CONFIG card and (optionally)   │
+ │  the NOSTR card. Then click "Sign with Hive Keychain".                   │
+ │                                                                          │
+ │  KEYCHAIN signs a "|"-joined canonical string with the HIVE ACCOUNT's    │
+ │  posting key. Output is a single signed JSON file.                       │
+ └────────────────────────────┬─────────────────────────────────────────────┘
+                              │
+                              │ Download JSON →
+                              │ deploy to server's filesystem at
+                              │ /public/.well-known/v4call-server.json
+                              │ Rebuild + restart the v4call container.
+                              ▼
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │  https://YOUR-DOMAIN/.well-known/v4call-server.json                      │
+ │                                                                          │
+ │  Anyone in the world can fetch this. It's the cryptographic ground       │
+ │  truth: "This Hive account vouches for this domain."                     │
+ └────────────────────────────┬─────────────────────────────────────────────┘
+                              │
+                              │ "Next step →" link in server-sign.html
+                              │ opens server-announce.html with all the
+                              │ same fields prefilled via querystring
+                              ▼
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │  Step 2 — server-announce.html                                           │
+ │                                                                          │
+ │  Fields are auto-filled from server-sign. Verify they match. Click       │
+ │  "Post to Hive". KEYCHAIN signs a Hive post broadcast.                   │
+ └────────────────────────────┬─────────────────────────────────────────────┘
+                              │
+                              │ Hive consensus stores the post forever.
+                              │ Tagged "v4call-server".
+                              ▼
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │  HIVE BLOCKCHAIN — the public directory of v4call servers                │
+ │                                                                          │
+ │  Other nGate operators query this for new candidates.                    │
+ └────────────────────────────┬─────────────────────────────────────────────┘
+                              │
+                              │ ngate-scan.sh queries Hive
+                              ▼
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │  ngate-scan.sh — Phase 3.1                                               │
+ │                                                                          │
+ │  Reads each post's V4CALL-SERVER-V1 block, emits NDJSON candidate.       │
+ └────────────────────────────┬─────────────────────────────────────────────┘
+                              │
+                              ▼
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │  ngate-verify.sh — Phase 3.2                                             │
+ │                                                                          │
+ │  For each candidate, fetches the well-known JSON and runs FIVE checks:   │
+ │  ─────────────────────────────────────────────────────────────────────   │
+ │                                                                          │
+ │  ① Reachable: HTTPS GET of verify_url returns 200 + parses as JSON       │
+ │  ② Schema: well-known has claim, signature, hive_account, nonce          │
+ │  ③ HIVE-ACCOUNT cross-check:                                             │
+ │     well-known.hive_account == post's HIVE-ACCOUNT field                 │
+ │  ④ NOSTR-HEX cross-check (defense in depth, optional):                   │
+ │     well-known.nostr_hex == post's NOSTR-PUBKEY-HEX (if both present)    │
+ │  ⑤ SIGNATURE cross-check:                                                │
+ │     fetches HIVE-ACCOUNT's posting pubkey from Hive,                     │
+ │     reproduces canonical "|"-joined payload from well-known fields,      │
+ │     verifies signature using @hiveio/dhive                               │
+ └────────────────────────────┬─────────────────────────────────────────────┘
+                              │
+                              ▼
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │  ngate-gate.sh — Phase 3.3                                               │
+ │                                                                          │
+ │  For each verified candidate, picks the gate target:                     │
+ │   • NGATE_GATE_ACCOUNT=escrow (default) → checks ESCROW account          │
+ │   • NGATE_GATE_ACCOUNT=hive_account     → checks HIVE-ACCOUNT             │
+ │                                                                          │
+ │  Fetches HP from Hive, fetches token balance from Hive-Engine,           │
+ │  applies thresholds and OR/AND mode, emits passing candidates.           │
+ └──────────────────────────────────────────────────────────────────────────┘
+
+== server-sign.html — field-by-field reference ==
+
+What to put in each field, what value type, where it ends up. Every field is in BOTH the signed JSON AND (later, by querystring chain) the announce post.
+
+{| class="wikitable"
+! Field !! Type !! Example !! ⚠ Common mistakes
+|-
+| HIVE ACCOUNT (the one that signs) || Hive account name || <code>cnoobs</code> || ❌ Putting the domain (<code>cnoobs.com</code>). ❌ Putting an email. ❌ Putting a Nostr npub.
+|-
+| DOMAIN || Hostname (no scheme, no path) || <code>call.completenoobs.com</code> || ❌ Adding <code>https://</code> or trailing slash. ❌ Putting a Hive account name.
+|-
+| ESCROW ACCOUNT || Hive account name || <code>cnoobs-escrow</code> || ❌ Same as HIVE ACCOUNT (allowed but not recommended — operational separation matters). ❌ Putting an account whose active key isn't on the v4call server.
+|-
+| FEE ACCOUNT || Hive account name || <code>cnoobs</code> || Often same as HIVE ACCOUNT. ❌ A different chain's account.
+|-
+| FEDERATION-WS || WebSocket URL || <code>wss://call.completenoobs.com/federation</code> || ❌ Missing <code>wss://</code>. ❌ Wrong domain. ❌ Forgetting <code>/federation</code>.
+|-
+| NOSTR PUBKEY (npub) || Bech32 string starting <code>npub1</code> || <code>npub1cxgaen…q57qw3d</code> || ❌ Pasting an nsec (the secret key — never paste secrets into form fields you didn't write yourself). ❌ Pasting hex into the npub field (use the auto-sync — it'll auto-fill).
+|-
+| NOSTR PUBKEY (hex) || 64-char lowercase hex || <code>c191dccd…1ba12c</code> || ❌ Uppercase. ❌ Wrong length. (Auto-fills if you typed a valid npub above.)
+|-
+| NOSTR RELAY 1–5 || WebSocket URLs || <code>wss://nostr.v4call.com</code> || ❌ Missing <code>wss://</code>. (Slots 3–5 left blank are silently skipped.)
+|-
+| ISSUED || Auto-filled || timestamp at sign time || (Don't touch — auto-filled by server-sign.)
+|-
+| NONCE || Auto-filled || random hex || (Don't touch — auto-filled.)
+|-
+| EXPIRES || Optional date || <code>2027-01-01</code> || (Most operators leave blank. Set only if you have a specific rotation schedule.)
+|}
+
+After signing, you '''download''' the signed JSON and '''deploy''' it to:
+* The v4call repo's <code>public/.well-known/v4call-server.json</code> (overwriting the placeholder).
+* Rebuild + restart: <code>docker compose down && docker compose build --no-cache && docker compose up -d</code>.
+* Test reachable: <code>curl https://YOUR-DOMAIN/.well-known/v4call-server.json</code> should return your file.
+
+== server-announce.html — field-by-field reference ==
+
+server-announce auto-fills from server-sign's "Next step →" link. Verify the prefilled fields match what you signed. Don't post mismatched data.
+
+{| class="wikitable"
+! Field !! Same as server-sign? !! Why it's here too
+|-
+| HIVE ACCOUNT (poster) || YES — must match || Hive consensus needs to know who's authoring this post.
+|-
+| DOMAIN || YES || nGate-scan reads this from the post; ngate-verify uses it to fetch the well-known.
+|-
+| ESCROW ACCOUNT || YES || Default gate target. Visible in the directory entry.
+|-
+| FEE ACCOUNT || YES || Visible in the directory entry. Informational.
+|-
+| FEDERATION-WS || YES || How peer servers connect for federation.
+|-
+| VERIFY URL (auto) || Auto-computed from DOMAIN || <code>https://DOMAIN/.well-known/v4call-server.json</code>.
+|-
+| SOFTWARE / PROTOCOL || Optional || Forks may put their own software name here.
+|-
+| NOSTR fields || YES (auto-filled from sign) || Optional. Lets nGate-scan pick up the Nostr key claim.
+|-
+| POST TAGS || <code>v4call-server, v4call, hive</code> || First tag MUST be <code>v4call-server</code> — that's what nGate-scan searches for.
+|-
+| INTRO PARAGRAPH || Optional human readable || Just the prose at the top of the post. Doesn't affect any field parsing.
+|}
+
+After clicking "Post to Hive" + Keychain confirm, the post is live on Hive. '''The post is permanent''' — Hive doesn't allow deletion. If you made a typo, you can publish a NEW post with the corrected fields; nGate-scan picks up the most recent one for each (account, domain) pair.
+
+== What ends up in the signed JSON ==
+
+The JSON file at <code>/.well-known/v4call-server.json</code>. Public, fetchable from anywhere, signed by your HIVE ACCOUNT's posting key.
+
+ {
+   "claim":         "v4call-server-ownership",        ← fixed string
+   "domain":        "call.completenoobs.com",         ← from DOMAIN
+   "hive_account":  "cnoobs",                         ← from HIVE ACCOUNT
+   "escrow":        "cnoobs-escrow",                  ← from ESCROW ACCOUNT
+   "fee_account":   "cnoobs",                         ← from FEE ACCOUNT
+   "federation_ws": "wss://call.completenoobs.com/federation",
+   "issued":        "2026-05-08T11:18:00Z",           ← auto
+   "expires":       "",                               ← optional
+   "nonce":         "abc123def456",                   ← auto
+   "key_type":      "posting",                        ← fixed
+   "signature":     "1f4a3b…",                        ← Hive ECDSA signature
+
+   // Optional Nostr fields (only present if you filled the NOSTR card):
+   "nostr_npub":    "npub1cxgaen…q57qw3d",
+   "nostr_hex":     "c191dccd…1ba12c",
+   "nostr_relays":  ["wss://nostr.v4call.com", "wss://nostr.hive-book.com"]
+ }
+
+The signature is over a single canonical string built from these fields in a fixed order — server-sign.html computes it; nGate-verify reproduces it. If a single character of any signed field is different between the well-known and what was signed, verification fails.
+
+== What ends up in the Hive post body ==
+
+The announce post body has a markdown-code-block like this (4 leading spaces per line — that's how Hive renders the block):
+
+     [V4CALL-SERVER-V1]
+     DOMAIN: call.completenoobs.com           ← from DOMAIN field
+     HIVE-ACCOUNT: cnoobs                     ← from HIVE ACCOUNT field
+     ESCROW: cnoobs-escrow                    ← from ESCROW ACCOUNT field
+     FEE-ACCOUNT: cnoobs                      ← from FEE ACCOUNT field
+     FEDERATION-WS: wss://call.completenoobs.com/federation
+     VERIFY-URL: https://call.completenoobs.com/.well-known/v4call-server.json
+     SOFTWARE: v4call
+     PROTOCOL: 0.3
+     NOSTR-PUBKEY: npub1cxgaen…q57qw3d        ← from NOSTR NPUB field
+     NOSTR-PUBKEY-HEX: c191dccd…1ba12c        ← from NOSTR HEX field
+     NOSTR-RELAYS: wss://nostr.v4call.com, wss://nostr.hive-book.com
+     DECLARED: 2026-05-08T11:18:30Z           ← timestamp at post time
+     [/V4CALL-SERVER-V1]
+
+ngate-scan reads exactly this block. Field names are matched case-sensitively after stripping leading whitespace. Lines that don't match a known field are ignored.
+
+== What nGate-verify cross-checks (and what each rejection means) ==
+
+In order — verify stops at the first failure for each candidate.
+
+{| class="wikitable"
+! Check !! Failure looks like !! Real-world cause !! Fix
+|-
+| Reachable + valid JSON || <code>could not fetch verify_url</code> || Domain not deployed yet, DNS not propagated, container not rebuilt after dropping in the new well-known file || Deploy the JSON, rebuild + restart container, test with curl
+|-
+| Schema fields exist || <code>well-known missing required fields</code> || Old or corrupted JSON file || Re-sign via server-sign.html, redeploy
+|-
+| Claim string == "v4call-server-ownership" || <code>wrong claim string</code> || Someone deployed a non-v4call signed JSON || (Won't happen if you used server-sign.html)
+|-
+| HIVE ACCOUNT match || <code>well-known hive_account (X) ≠ post's HIVE-ACCOUNT (Y)</code> || '''You typed a different value in the HIVE ACCOUNT field on server-sign vs. on server-announce''' (or you re-signed and forgot to re-announce) || Re-sign with the correct HIVE ACCOUNT, redeploy, re-announce
+|-
+| Nostr hex match (if both have it) || <code>well-known nostr_hex differs from post</code> || You signed with one Nostr key, then re-announced with a different one (typo or rotation) || Re-sign with the correct NOSTR HEX, redeploy, re-announce
+|-
+| Expires not in the past || <code>well-known expired at X</code> || You set an EXPIRES date that has already passed || Re-sign with a fresh ISSUED timestamp (and either no expiry or a future one)
+|-
+| Within-scan hex collision || <code>FORGERY-FLAG hex=… claimed by both @A and @B — both will be REJECTED</code> || Two operators announcing with the same Nostr hex (one is forged) || Both REJECTED on purpose. Only one operator should hold each Nostr keypair. Re-keying anyone caught in this is mandatory
+|-
+| Signature valid || <code>signature DID NOT verify</code> || The well-known was tampered with after signing, OR you signed with a different account's posting key by mistake || Re-sign via server-sign.html (fresh issued + nonce), redeploy
+|}
+
+== What nGate-gate looks at (and which account matters) ==
+
+By default, nGate-gate checks the '''ESCROW account''', not the announcing HIVE ACCOUNT.
+
+;Why escrow?
+:Escrow is the operational account — it actually moves money during paid calls. Gating on its HP/RC enforces "this server can actually operate," not just "the operator owns a Hive account."
+
+;When you'd switch to <code>NGATE_GATE_ACCOUNT=hive_account</code>:
+* Testing with a token gate where the HIVE-ACCOUNT holds the test tokens but the escrow doesn't (e.g. CNOOBS).
+* Specific governance use cases where the announcer's reputation matters more than the operational account's solvency.
+
+;'''Worked example from a real test session''' (yours):
+* You staked 3 HP on <code>v4call</code> (the HIVE-ACCOUNT).
+* nGate-gate's default = check ESCROW = <code>v4call-escrow</code>.
+* <code>v4call-escrow</code> still has 0 HP.
+* Result: rejected with <code>gate→@v4call-escrow … hp=0.000/3=false</code>.
+* Fix A (no Hive transactions): <code>NGATE_GATE_ACCOUNT=hive_account NGATE_MIN_HP=3 ./ngate-gate.sh</code> → checks <code>v4call</code>'s HP, passes.
+* Fix B (matches default architecture): Power Up 3 HIVE on <code>v4call-escrow</code> directly.
+
+== Common mistakes — based on real test sessions ==
+
+;'''Mistake #1: Putting the domain in HIVE ACCOUNT'''
+:Result: well-known has <code>"hive_account": "your-domain.com"</code>. nGate-verify rejects with <code>well-known hive_account (your-domain.com) ≠ post's HIVE-ACCOUNT (your-account)</code>.
+:Fix: server-sign.html with HIVE ACCOUNT = <code>your-account</code> (just the Hive name, no .com).
+
+;'''Mistake #2: Staking HP on the wrong account'''
+:Result: gate fails for an operator you'd expect to pass.
+:Fix: read the <code>(gate→@account)</code> in the rejection — it tells you which account was checked. Stake there, OR change <code>NGATE_GATE_ACCOUNT</code>.
+
+;'''Mistake #3: Not re-announcing after re-signing'''
+:Result: well-known has updated fields, but the post on Hive still has the old ones. nGate-verify cross-checks see a mismatch.
+:Fix: '''always do server-sign + server-announce together as a pair'''. The "Next step →" button on server-sign goes to server-announce with prefilled fields exactly to keep these in sync.
+
+;'''Mistake #4: Pre-Nostr announce posts still in the scan window'''
+:Symptom: <code>skip @user/domain — no nostr_pubkey_hex (pre-Nostr announce; not an error)</code>.
+:Cause: you announced before nostr fields were added; the old post still appears in Hive's recent-20 query.
+:Fix: nothing required. Each operator only needs ONE current announce; older posts age out. If you want the relay to stop seeing them sooner, just publish a fresh announce — your latest takes precedence in Hive's recent-by-created order.
+
+;'''Mistake #5: Signing without rebuilding the container'''
+:Result: deployed the new well-known JSON to disk but the v4call Docker container still serves the old one (Docker images bake in static files at build time).
+:Fix: <code>docker compose down && docker compose build --no-cache && docker compose up -d</code> after every well-known change.
+
+;'''Mistake #6: Posting before deploying the well-known'''
+:Result: announce post is live on Hive; nGate-scan picks it up; nGate-verify tries to fetch the well-known and gets a 404 → rejection.
+:Fix: deploy + rebuild + verify with curl FIRST, then announce. Or fix the well-known and wait for the next scan cycle — eventual consistency.
+
+;'''Mistake #7: Staking "exactly N HIVE" but the gate at <code>NGATE_MIN_HP=N</code> still fails'''
+:Symptom: <code>REJECT … gate failed hp=2.999/3=false</code> (or some near-round-number mismatch).
+:Cause: HIVE → VESTS → HP round-trip uses 6-decimal vesting math. Staking exactly 3 HIVE can land at 2.999something HP, not exactly 3.000. The gate's comparison is correct (<code>&gt;=</code> not <code>&gt;</code>), but the input itself is just slightly under the threshold.
+:Fix A: Stake slightly above the threshold (e.g. 4 HIVE for a <code>NGATE_MIN_HP=3</code> gate).
+:Fix B: Set the threshold slightly below the stake (e.g. <code>NGATE_MIN_HP=2.5</code>).
+:Both work. The first feels "rounder" to the operator; the second uses fewer HIVE. Either is fine.
+
+;'''Mistake #8 — a transient Hive RPC outage shows up as an ERROR line'''
+:Symptom: <code>ngate-gate: ERROR … HP fetch failed (transient Hive RPC); not passing</code> on one or more candidates, with the run summary showing <code>errors=1</code>+.
+:Cause: Hive node didn't respond before the script's timeout. Not your fault; not a config bug.
+:What happens: that candidate is treated as "not passing" for THIS run, so it doesn't get added/refreshed. The script exits with code 2 (partial fetch errors). Phase 3.4 reads this exit code and refuses to REMOVE any existing entries from the whitelist — so a single bad cycle can't kick legitimate operators off your relay.
+:Fix: nothing required. Re-run when Hive is healthy. The "ADD-only on partial failure" rule is the design's safety net; this output is what it looks like working.
+
+== Clean-redo checklist ==
+
+If you're re-doing an operator's announce and want to be sure each step is correct, follow this exact order. Tick them off mentally as you go.
+
+# '''☐ Confirm your three accounts and one domain''' on a piece of paper:
+#: HIVE ACCOUNT  = ___________________  (e.g. <code>cnoobs</code>, no <code>.com</code>)
+#: ESCROW ACCT   = ___________________  (e.g. <code>cnoobs-escrow</code>, no <code>.com</code>)
+#: FEE ACCT      = ___________________  (often same as HIVE ACCOUNT)
+#: DOMAIN        = ___________________  (e.g. <code>call.completenoobs.com</code>, no scheme/path)
+#: NOSTR NPUB    = ___________________  (from <code>nostr-gen.html</code>)
+# '''☐ Open server-sign.html'''. Fill the IDENTITY card, SERVER CONFIG card, and (optionally) NOSTR card with the values above. Verify each line of the form against your paper.
+# '''☐ Click "Sign with Hive Keychain"'''. Confirm in Keychain.
+# '''☐ Download the signed JSON'''. Open it in a text editor. Eyeball the top fields — they should match your paper.
+# '''☐ Deploy the JSON to your v4call repo''' at <code>public/.well-known/v4call-server.json</code> (overwriting whatever was there).
+# '''☐ Rebuild + restart''' your v4call container: <code>docker compose down && docker compose build --no-cache && docker compose up -d</code>.
+# '''☐ Test reachability''': <code>curl https://YOUR-DOMAIN/.well-known/v4call-server.json</code> on your laptop. Should return the same JSON you just deployed.
+# '''☐ Click the "Next step →" link''' on server-sign.html (it auto-opens server-announce.html with all fields prefilled from the querystring). Verify the prefilled fields match your paper.
+# '''☐ Click "Post to Hive"'''. Confirm in Keychain. Wait for the success banner.
+# '''☐ Verify end-to-end''': from your laptop, run <code>./nGate/scripts/ngate-scan.sh | ./nGate/scripts/ngate-verify.sh</code>. Look for <code>OK @your-account/your-domain — signature valid</code>.
+# '''☐ Test the gate''': <code>./ngate-scan.sh | ./ngate-verify.sh | NGATE_MIN_HP=3 ./ngate-gate.sh</code>. Read the <code>(gate→@account)</code> on each rejection — that's the account whose HP it's checking. Stake there OR pick a different gate target.
+
+If anything fails, the rejection message tells you which check failed — see "What nGate-verify cross-checks" or "What nGate-gate looks at" above for the recipe.
+
+== Quick reference card ==
+
+Print this. Tape it next to your monitor while doing operator work.
+
+ ╔══════════════════════════════════════════════════════════════════════╗
+ ║                  v4call ANNOUNCE QUICK REFERENCE                     ║
+ ╠══════════════════════════════════════════════════════════════════════╣
+ ║                                                                      ║
+ ║  3 ACCOUNTS + 1 DOMAIN — these are NOT the same thing:               ║
+ ║                                                                      ║
+ ║    HIVE ACCOUNT   →  signs the announce      (e.g. cnoobs)           ║
+ ║    ESCROW ACCT    →  holds funds, gate target (e.g. cnoobs-escrow)   ║
+ ║    FEE ACCT       →  receives platform fees   (often = HIVE ACCT)    ║
+ ║    DOMAIN         →  internet hostname        (call.completenoobs.com)║
+ ║                                                                      ║
+ ║  ALWAYS DO TOGETHER (one breaks if you skip the other):              ║
+ ║                                                                      ║
+ ║    server-sign.html  ─→  deploy + rebuild  ─→  server-announce.html  ║
+ ║                                                                      ║
+ ║  STAKING FOR THE GATE — stake on the right account:                  ║
+ ║                                                                      ║
+ ║    NGATE_GATE_ACCOUNT=escrow (default) → stake on ESCROW             ║
+ ║    NGATE_GATE_ACCOUNT=hive_account     → stake on HIVE ACCT          ║
+ ║                                                                      ║
+ ║  WHEN VERIFY FAILS — read the rejection reason:                      ║
+ ║                                                                      ║
+ ║    "well-known hive_account (X) ≠ post's HIVE-ACCOUNT (Y)"           ║
+ ║       → typo on one of the two; re-sign with correct value           ║
+ ║                                                                      ║
+ ║    "signature DID NOT verify"                                        ║
+ ║       → well-known tampered with OR signed by wrong account          ║
+ ║       → re-sign cleanly                                              ║
+ ║                                                                      ║
+ ║    "could not fetch verify_url"                                      ║
+ ║       → JSON not deployed OR container not rebuilt                   ║
+ ║       → docker compose down/build/up, curl-test from laptop          ║
+ ║                                                                      ║
+ ║    "skip … no nostr_pubkey_hex"                                      ║
+ ║       → pre-Nostr announce, harmless, ignore                         ║
+ ║                                                                      ║
+ ║  DEFAULT GATE TARGET:                                                ║
+ ║                                                                      ║
+ ║    Escrow account. (Operational solvency check.)                     ║
+ ║    To check announcing account instead:                              ║
+ ║       NGATE_GATE_ACCOUNT=hive_account                                ║
+ ║                                                                      ║
+ ╚══════════════════════════════════════════════════════════════════════╝

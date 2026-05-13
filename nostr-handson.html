@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Nostr Hands-On — completenoobs</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root {
+  --bg: #0d0d0d;
+  --surface: #1a1a1a;
+  --surface2: #252525;
+  --accent: #f5a623;
+  --green: #5cb85c;
+  --blue: #5bc0de;
+  --purple: #9b59b6;
+  --red: #d9534f;
+  --text: #e0e0e0;
+  --subtext: #b0b0b0;
+  --muted: #707070;
+  --border: #333;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  margin: 0;
+  padding: 20px;
+  max-width: 1100px;
+  margin-left: auto; margin-right: auto;
+}
+header {
+  border-bottom: 2px solid var(--accent);
+  padding-bottom: 10px;
+  margin-bottom: 20px;
+}
+header h1 { margin: 0; color: var(--accent); font-family: 'IBM Plex Mono', monospace; }
+header p { color: var(--subtext); margin: 6px 0 0; font-size: 0.9rem; }
+
+section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+}
+section h2 {
+  margin: 0 0 8px;
+  color: var(--accent);
+  font-size: 0.95rem;
+  font-family: 'IBM Plex Mono', monospace;
+}
+.help {
+  color: var(--subtext);
+  font-size: 0.85rem;
+  margin-bottom: 10px;
+  line-height: 1.4;
+}
+
+input, textarea, button, select {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 10px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.85rem;
+}
+input:focus, textarea:focus { border-color: var(--accent); outline: none; }
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 600; }
+button.primary:hover { filter: brightness(1.1); }
+button.danger { color: var(--red); border-color: var(--red); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+.row > input { flex: 1; min-width: 200px; }
+
+.warn {
+  background: rgba(217,83,79,0.08);
+  border: 1px solid var(--red);
+  color: var(--red);
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: 0.82rem;
+  margin-bottom: 10px;
+  line-height: 1.4;
+}
+.tip {
+  background: rgba(245,166,35,0.07);
+  border: 1px solid rgba(245,166,35,0.3);
+  color: var(--subtext);
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  margin-top: 8px;
+  line-height: 1.4;
+}
+
+.tab-buttons { display: flex; gap: 4px; margin-bottom: 10px; }
+.tab-buttons button {
+  border-bottom: 2px solid transparent;
+  border-radius: 4px 4px 0 0;
+}
+.tab-buttons button.active {
+  border-bottom-color: var(--accent);
+  color: var(--accent);
+}
+.tab-pane { display: none; }
+.tab-pane.active { display: block; }
+
+#relay-list { display: flex; flex-direction: column; gap: 6px; }
+.relay-row {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--surface2);
+  padding: 6px 10px;
+  border-radius: 4px;
+  flex-wrap: wrap;
+}
+.relay-row .url { flex: 1; font-family: 'IBM Plex Mono', monospace; font-size: 0.82rem; min-width: 200px; }
+.relay-row .status {
+  font-size: 0.72rem;
+  font-family: 'IBM Plex Mono', monospace;
+  padding: 2px 6px;
+  border-radius: 3px;
+  min-width: 88px;
+  text-align: center;
+}
+.status.disconnected { background: #444; color: var(--muted); }
+.status.connecting { background: var(--purple); color: white; }
+.status.open { background: var(--green); color: white; }
+.status.error { background: var(--red); color: white; }
+.relay-row .msgs { font-size: 0.72rem; color: var(--muted); min-width: 60px; }
+
+textarea { width: 100%; min-height: 70px; resize: vertical; }
+
+#event-log {
+  max-height: 600px;
+  overflow-y: auto;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.78rem;
+}
+.log-entry {
+  padding: 6px 8px;
+  margin-bottom: 5px;
+  border-radius: 4px;
+  border-left: 3px solid;
+}
+.log-entry.in { background: rgba(91,192,222,0.05); border-left-color: var(--blue); }
+.log-entry.out { background: rgba(245,166,35,0.05); border-left-color: var(--accent); }
+.log-entry.system { background: rgba(112,112,112,0.08); border-left-color: var(--muted); }
+.log-entry.error { background: rgba(217,83,79,0.05); border-left-color: var(--red); }
+.log-entry .head {
+  color: var(--subtext);
+  font-size: 0.72rem;
+  margin-bottom: 3px;
+}
+.log-entry .summary { color: var(--text); margin-bottom: 4px; word-break: break-word; }
+.log-entry pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--bg);
+  padding: 6px;
+  border-radius: 3px;
+  color: var(--subtext);
+  max-height: 240px;
+  overflow-y: auto;
+  cursor: pointer;
+  font-size: 0.74rem;
+}
+.log-entry pre.collapsed { max-height: 38px; overflow: hidden; }
+.log-entry .relay-tag {
+  display: inline-block;
+  background: var(--surface);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 0.7rem;
+  color: var(--accent);
+  margin-right: 4px;
+}
+.identity-display {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.82rem;
+  word-break: break-all;
+  background: var(--surface2);
+  padding: 8px 10px;
+  border-radius: 4px;
+}
+.identity-display strong { color: var(--accent); display: inline-block; min-width: 110px; }
+.muted { color: var(--muted); }
+small.help-inline { color: var(--muted); font-size: 0.75rem; margin-left: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Nostr Hands-On</h1>
+  <p>A bare-metal Nostr learning page. One file, no install, no client opinions, no follow lists, no profile rendering. Every WebSocket message is logged in section 5 <strong>and mirrored to the browser console</strong> (open DevTools / F12). Read the source — it <em>is</em> the tutorial.</p>
+</header>
+
+<section>
+  <h2>1. Identity — load a private key</h2>
+  <div class="help">Paste your <code>nsec1...</code> or 64-char hex private key. The key stays in this tab's memory only — it's never sent to any server, written to disk, or kept after you close the tab.</div>
+  <div class="warn"><strong>⚠ Use a disposable key.</strong> The privkey lives in plain JS memory while this tab is open. Browser extensions, page bugs, or future you forgetting which tab is which can all expose it. For real Nostr usage, use a NIP-07 extension (nos2x / Alby) — see the wiki.</div>
+  <div class="row">
+    <input id="nsec-input" type="password" placeholder="nsec1... or 64-char hex" autocomplete="off">
+    <button id="load-key" class="primary">Load Key</button>
+    <button id="forget-key">Forget</button>
+  </div>
+  <div id="identity-out" class="identity-display muted">No key loaded.</div>
+</section>
+
+<section>
+  <h2>2. Relays — open WebSockets</h2>
+  <div class="help">Pick which relays to use. Click <strong>Connect</strong> on each one. Status flips disconnected → connecting → open. Read-only relays don't need your key. Write relays need your pubkey on the relay's whitelist (for your private relays, that means you set them up correctly in <code>config.toml</code>).</div>
+  <div id="relay-list"></div>
+  <div class="row" style="margin-top:10px;">
+    <input id="new-relay" placeholder="wss://your-relay.example.com" autocomplete="off">
+    <button id="add-relay">Add relay</button>
+  </div>
+  <div class="tip">A "Connect" failure is almost always: bad URL, relay offline, or your network blocking outbound 443. Check the system log entry for the WebSocket error.</div>
+</section>
+
+<section>
+  <h2>3. Compose — sign and publish events</h2>
+  <div class="help">Build a Nostr event, sign it with your loaded key, and broadcast to every <em>open</em> relay. The signed event is logged in section 5 — check the JSON to see <code>id</code> (sha256 of canonical fields), <code>sig</code> (schnorr), <code>tags</code>, etc.</div>
+  <div class="tab-buttons">
+    <button class="tab-btn active" data-tab="note">Public Note (kind 1)</button>
+    <button class="tab-btn" data-tab="dm">DM (kind 4 / NIP-04)</button>
+  </div>
+  <div class="tab-pane active" data-pane="note">
+    <textarea id="note-content" placeholder="What's on your mind? (kind 1 = a public note. The whole world can read this on any relay you publish to.)"></textarea>
+    <div class="row" style="margin-top:8px;">
+      <button id="send-note" class="primary">Sign &amp; Publish</button>
+      <small class="help-inline">Goes to every relay currently in the open state.</small>
+    </div>
+  </div>
+  <div class="tab-pane" data-pane="dm">
+    <input id="dm-recipient" placeholder="Recipient npub1... or 64-char hex" autocomplete="off">
+    <textarea id="dm-content" placeholder="Encrypted message body" style="margin-top:6px;"></textarea>
+    <div class="row" style="margin-top:8px;">
+      <button id="send-dm" class="primary">Encrypt, Sign &amp; Publish</button>
+      <small class="help-inline">NIP-04: end-to-end encrypted. Relays see the ciphertext + the recipient's pubkey, not the body.</small>
+    </div>
+    <div class="tip">NIP-04 is the original DM scheme — old, deprecated for new clients (NIP-17 is the modern one), but transparent and supported everywhere. Good for learning. <strong>Do not</strong> use it as your main DM transport long-term.</div>
+  </div>
+</section>
+
+<section>
+  <h2>4. Subscribe — ask relays for events</h2>
+  <div class="help">A subscription is a <code>REQ</code> message with one or more filter objects. Relays send matching stored events, then <code>EOSE</code> (end of stored events), then keep streaming new matches in real time until you <code>CLOSE</code>.</div>
+  <div class="row">
+    <button class="sub-preset" data-preset="my-events">My events</button>
+    <button class="sub-preset" data-preset="my-dms">DMs to me</button>
+    <button class="sub-preset" data-preset="lookup-author">Lookup author…</button>
+    <button class="sub-preset" data-preset="firehose">Firehose (latest 20 kind 1)</button>
+    <button id="cancel-subs" class="danger">Cancel all subs</button>
+  </div>
+  <div id="active-subs" class="muted" style="margin-top: 8px; font-size: 0.78rem;"></div>
+  <div class="tip">Filters are JSON predicates: <code>{kinds:[1], authors:[hex]}</code>, <code>{kinds:[4], "#p":[my-hex]}</code>, etc. Relays AND the conditions inside a filter, OR across multiple filters in one REQ.</div>
+</section>
+
+<section>
+  <h2>5. Event Log — every WebSocket message in/out</h2>
+  <div class="help">Click any JSON block to expand/collapse. Browser console (F12) gets the same data — useful for searching with Ctrl+F. Outgoing in <span style="color:var(--accent)">orange</span>, incoming in <span style="color:var(--blue)">blue</span>, system in grey, errors in red.</div>
+  <div class="row">
+    <button id="clear-log">Clear log</button>
+    <label style="font-size:0.82rem;"><input type="checkbox" id="show-raw" checked> Show raw JSON</label>
+  </div>
+  <div id="event-log"></div>
+</section>
+
+<script type="module">
+// ============================================================================
+// Imports — pure browser ESM via esm.sh, no install, no build step.
+// ============================================================================
+//
+// nostr-tools gives us: schnorr signing, schnorr verification, sha256 event-id,
+// bech32 (npub/nsec) encode/decode, and NIP-04 ECDH+AES encryption.
+// We deliberately use raw WebSockets (not the nostr-tools Relay class) so the
+// REQ/EVENT/EOSE/OK/NOTICE/CLOSE wire dance is fully visible.
+//
+// Pinned to a specific 2.x version so this file keeps working when nostr-tools
+// 3.x ships with breaking changes.
+import {
+  finalizeEvent,    // adds id + sig to an unsigned event
+  getPublicKey,     // priv (Uint8Array) -> hex pubkey
+  verifyEvent,      // validates id + sig
+  nip04,            // .encrypt(priv, theirPub, plain) / .decrypt(priv, theirPub, cipher)
+  nip19             // .npubEncode / .nsecEncode / .decode
+} from 'https://esm.sh/nostr-tools@2.7.2';
+
+// ============================================================================
+// State
+// ============================================================================
+
+const state = {
+  privkey: null,        // Uint8Array(32) — null until a key is loaded
+  pubkey: null,         // hex string (64 chars)
+  npub: null,           // bech32 npub
+  relays: new Map(),    // url -> { ws, status, msgs }
+  subs:   new Map()     // subId -> { filters }
+};
+
+const DEFAULT_RELAYS = [
+  'wss://nostr.hive-book.com',
+  'wss://nostr.v4call.com',
+  'wss://relay.damus.io',
+  'wss://nos.lol'
+];
+
+// ============================================================================
+// Tiny helpers
+// ============================================================================
+
+function hexToBytes(hex) {
+  if (hex.length % 2) throw new Error('hex string odd length');
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i*2, i*2+2), 16);
+  return out;
+}
+function shortKey(hex)   { return hex ? hex.slice(0, 8) + '…' + hex.slice(-4) : ''; }
+function shortNpub(npub) { return npub ? npub.slice(0, 12) + '…' + npub.slice(-4) : ''; }
+function nowSec()        { return Math.floor(Date.now() / 1000); }
+function timeStr() {
+  const d = new Date();
+  return d.toTimeString().slice(0,8) + '.' + String(d.getMilliseconds()).padStart(3,'0');
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
+// ============================================================================
+// Logging — every WS in/out shows up here AND in console.log
+// ============================================================================
+
+const logEl = document.getElementById('event-log');
+
+function addLog({ type, relay, summary, raw }) {
+  const showRaw = document.getElementById('show-raw').checked;
+  const div = document.createElement('div');
+  div.className = 'log-entry ' + type;
+  let html = `<div class="head">${timeStr()} `;
+  if (relay)   html += `<span class="relay-tag">${escapeHtml(relay)}</span> `;
+  html += `<span class="muted">${type.toUpperCase()}</span></div>`;
+  if (summary) html += `<div class="summary">${escapeHtml(summary)}</div>`;
+  if (raw && showRaw) {
+    let pretty;
+    try {
+      const obj = (typeof raw === 'string') ? JSON.parse(raw) : raw;
+      pretty = JSON.stringify(obj, null, 2);
+    } catch { pretty = String(raw); }
+    html += `<pre class="collapsed">${escapeHtml(pretty)}</pre>`;
+  }
+  div.innerHTML = html;
+  logEl.prepend(div);
+  const pre = div.querySelector('pre');
+  if (pre) pre.addEventListener('click', () => pre.classList.toggle('collapsed'));
+  // mirror to browser console for grep / Ctrl+F
+  console.log(`[${type}]`, relay || '-', summary || '', raw ?? '');
+}
+
+// ============================================================================
+// Identity
+// ============================================================================
+
+const idOut = document.getElementById('identity-out');
+
+document.getElementById('load-key').addEventListener('click', () => {
+  const raw = document.getElementById('nsec-input').value.trim();
+  if (!raw) return;
+  try {
+    let priv;
+    if (raw.startsWith('nsec1')) {
+      const decoded = nip19.decode(raw);
+      if (decoded.type !== 'nsec') throw new Error('not an nsec');
+      priv = decoded.data;          // Uint8Array(32)
+    } else if (/^[0-9a-f]{64}$/i.test(raw)) {
+      priv = hexToBytes(raw.toLowerCase());
+    } else {
+      throw new Error('paste an nsec1... or 64-char hex');
+    }
+    state.privkey = priv;
+    state.pubkey  = getPublicKey(priv);
+    state.npub    = nip19.npubEncode(state.pubkey);
+    idOut.classList.remove('muted');
+    idOut.innerHTML = `
+      <div><strong>npub</strong> ${escapeHtml(state.npub)}</div>
+      <div><strong>hex pubkey</strong> ${escapeHtml(state.pubkey)}</div>
+    `;
+    addLog({ type:'system', summary:`Loaded identity ${shortNpub(state.npub)}`, raw:{ npub: state.npub, pubkey: state.pubkey } });
+    document.getElementById('nsec-input').value = '';
+  } catch (e) {
+    addLog({ type:'error', summary:`Failed to load key: ${e.message}`, raw:null });
+    alert('Bad key: ' + e.message);
+  }
+});
+
+document.getElementById('forget-key').addEventListener('click', () => {
+  state.privkey = null;
+  state.pubkey  = null;
+  state.npub    = null;
+  idOut.classList.add('muted');
+  idOut.textContent = 'No key loaded.';
+  addLog({ type:'system', summary:'Identity forgotten (privkey wiped from memory).', raw:null });
+});
+
+// ============================================================================
+// Relays
+// ============================================================================
+
+const relayListEl = document.getElementById('relay-list');
+
+function renderRelayRow(url) {
+  const r = state.relays.get(url) || { ws:null, status:'disconnected', msgs:0 };
+  let row = relayListEl.querySelector(`[data-url="${CSS.escape(url)}"]`);
+  if (!row) {
+    row = document.createElement('div');
+    row.className = 'relay-row';
+    row.dataset.url = url;
+    row.innerHTML = `
+      <span class="url">${escapeHtml(url)}</span>
+      <span class="status disconnected">disconnected</span>
+      <span class="msgs"></span>
+      <button class="connect-btn">Connect</button>
+      <button class="disconnect-btn" style="display:none;">Disconnect</button>
+      <button class="remove-btn" title="Remove">×</button>
+    `;
+    relayListEl.appendChild(row);
+    row.querySelector('.connect-btn').addEventListener('click', () => connectRelay(url));
+    row.querySelector('.disconnect-btn').addEventListener('click', () => disconnectRelay(url));
+    row.querySelector('.remove-btn').addEventListener('click', () => {
+      disconnectRelay(url);
+      state.relays.delete(url);
+      row.remove();
+    });
+  }
+  const statusEl = row.querySelector('.status');
+  statusEl.className = 'status ' + r.status;
+  statusEl.textContent = r.status;
+  row.querySelector('.msgs').textContent = r.msgs ? `${r.msgs} msgs` : '';
+  const open = (r.status === 'open' || r.status === 'connecting');
+  row.querySelector('.connect-btn').style.display    = open ? 'none' : '';
+  row.querySelector('.disconnect-btn').style.display = open ? '' : 'none';
+}
+
+function connectRelay(url) {
+  let r = state.relays.get(url);
+  if (!r) { r = { ws:null, status:'disconnected', msgs:0 }; state.relays.set(url, r); }
+  if (r.ws && (r.ws.readyState === WebSocket.CONNECTING || r.ws.readyState === WebSocket.OPEN)) return;
+  r.status = 'connecting';
+  renderRelayRow(url);
+  addLog({ type:'system', relay:url, summary:'Connecting…', raw:null });
+  let ws;
+  try {
+    ws = new WebSocket(url);
+  } catch (e) {
+    r.status = 'error';
+    addLog({ type:'error', relay:url, summary:e.message, raw:null });
+    renderRelayRow(url);
+    return;
+  }
+  r.ws = ws;
+  ws.addEventListener('open', () => {
+    r.status = 'open';
+    addLog({ type:'system', relay:url, summary:'WebSocket open.', raw:null });
+    renderRelayRow(url);
+    // Re-attach existing subs to the newly opened relay
+    for (const [subId, sub] of state.subs) {
+      const msg = ['REQ', subId, ...sub.filters];
+      ws.send(JSON.stringify(msg));
+      addLog({ type:'out', relay:url, summary:`REQ ${subId} (re-attached)`, raw:msg });
+    }
+  });
+  ws.addEventListener('message', (ev) => {
+    r.msgs++;
+    renderRelayRow(url);
+    let parsed;
+    try { parsed = JSON.parse(ev.data); }
+    catch { addLog({ type:'in', relay:url, summary:'non-JSON message', raw:ev.data }); return; }
+    handleRelayMessage(url, parsed);
+  });
+  ws.addEventListener('close', () => {
+    r.status = 'disconnected';
+    addLog({ type:'system', relay:url, summary:'WebSocket closed.', raw:null });
+    renderRelayRow(url);
+  });
+  ws.addEventListener('error', () => {
+    r.status = 'error';
+    addLog({ type:'error', relay:url, summary:'WebSocket error (DNS / TLS / blocked port?)', raw:null });
+    renderRelayRow(url);
+  });
+}
+
+function disconnectRelay(url) {
+  const r = state.relays.get(url);
+  if (r && r.ws) { try { r.ws.close(); } catch {} }
+}
+
+function handleRelayMessage(url, msg) {
+  if (!Array.isArray(msg)) {
+    addLog({ type:'in', relay:url, summary:'unknown shape', raw:msg });
+    return;
+  }
+  const verb = msg[0];
+  if (verb === 'EVENT') {
+    const [, subId, ev] = msg;
+    let summary = `EVENT sub=${subId} kind=${ev.kind} from=${shortKey(ev.pubkey)}`;
+    // Auto-decrypt kind 4 if I can
+    if (ev.kind === 4 && state.privkey) {
+      const myHex = state.pubkey;
+      const iAmRecipient = ev.tags.some(t => t[0] === 'p' && t[1] === myHex);
+      const iAmSender    = ev.pubkey === myHex;
+      if (iAmRecipient || iAmSender) {
+        const counterparty = iAmRecipient ? ev.pubkey : (ev.tags.find(t => t[0] === 'p') || [])[1];
+        if (counterparty) {
+          nip04.decrypt(state.privkey, counterparty, ev.content)
+            .then(plain => {
+              const tag = iAmRecipient ? `from ${shortKey(ev.pubkey)}` : `to ${shortKey(counterparty)}`;
+              addLog({ type:'in', relay:url, summary:`DM (decrypted) ${tag}: ${plain}`, raw:ev });
+            })
+            .catch(e => addLog({ type:'in', relay:url, summary:`${summary} — decrypt failed: ${e.message}`, raw:ev }));
+          return;
+        }
+      }
+    }
+    if (ev.kind === 1) summary += ` content="${(ev.content || '').slice(0, 80).replace(/\n/g,' ')}"`;
+    addLog({ type:'in', relay:url, summary, raw:ev });
+  } else if (verb === 'EOSE') {
+    addLog({ type:'in', relay:url, summary:`EOSE sub=${msg[1]} (end of stored events; live updates continue)`, raw:msg });
+  } else if (verb === 'OK') {
+    const [, eventId, accepted, reason] = msg;
+    addLog({ type:'in', relay:url, summary:`OK ${shortKey(eventId)} accepted=${accepted}${reason ? ' reason="'+reason+'"' : ''}`, raw:msg });
+  } else if (verb === 'NOTICE') {
+    addLog({ type:'in', relay:url, summary:`NOTICE: ${msg[1]}`, raw:msg });
+  } else if (verb === 'CLOSED') {
+    addLog({ type:'in', relay:url, summary:`CLOSED sub=${msg[1]}${msg[2] ? ' reason="'+msg[2]+'"' : ''}`, raw:msg });
+  } else {
+    addLog({ type:'in', relay:url, summary:`unknown verb ${verb}`, raw:msg });
+  }
+}
+
+document.getElementById('add-relay').addEventListener('click', () => {
+  const url = document.getElementById('new-relay').value.trim();
+  if (!url) return;
+  if (!/^wss?:\/\//.test(url)) { alert('URL must start with wss:// or ws://'); return; }
+  if (!state.relays.has(url)) state.relays.set(url, { ws:null, status:'disconnected', msgs:0 });
+  renderRelayRow(url);
+  document.getElementById('new-relay').value = '';
+});
+
+DEFAULT_RELAYS.forEach(url => {
+  state.relays.set(url, { ws:null, status:'disconnected', msgs:0 });
+  renderRelayRow(url);
+});
+
+// ============================================================================
+// Tabs
+// ============================================================================
+
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelector(`[data-pane="${btn.dataset.tab}"]`).classList.add('active');
+  });
+});
+
+// ============================================================================
+// Compose: public note (kind 1)
+// ============================================================================
+
+document.getElementById('send-note').addEventListener('click', () => {
+  if (!state.privkey) return alert('Load your key in section 1 first.');
+  const content = document.getElementById('note-content').value;
+  if (!content.trim()) return alert('Note is empty.');
+
+  // Build the unsigned event. Per NIP-01, an event has these fields:
+  //   pubkey, created_at, kind, tags, content
+  // (id and sig are added by finalizeEvent.)
+  const unsigned = {
+    kind: 1,
+    created_at: nowSec(),
+    tags: [],
+    content
+  };
+  // finalizeEvent does:
+  //   1. set pubkey from priv
+  //   2. compute id = sha256( JSON([0, pubkey, created_at, kind, tags, content]) )
+  //   3. sign id with schnorr (BIP-340) using priv
+  //   4. attach id + sig to the event
+  const signed = finalizeEvent(unsigned, state.privkey);
+  if (!verifyEvent(signed)) {
+    addLog({ type:'error', summary:'verifyEvent failed — refusing to publish (this should never happen)', raw:signed });
+    return;
+  }
+  publishEvent(signed);
+  document.getElementById('note-content').value = '';
+});
+
+// ============================================================================
+// Compose: DM (kind 4 NIP-04)
+// ============================================================================
+
+document.getElementById('send-dm').addEventListener('click', async () => {
+  if (!state.privkey) return alert('Load your key in section 1 first.');
+  const recipRaw = document.getElementById('dm-recipient').value.trim();
+  const body     = document.getElementById('dm-content').value;
+  if (!recipRaw || !body.trim()) return alert('Need both recipient and message.');
+
+  let recipHex;
+  try {
+    if (recipRaw.startsWith('npub1')) {
+      const dec = nip19.decode(recipRaw);
+      if (dec.type !== 'npub') throw new Error('not an npub');
+      recipHex = dec.data;
+    } else if (/^[0-9a-f]{64}$/i.test(recipRaw)) {
+      recipHex = recipRaw.toLowerCase();
+    } else throw new Error('paste an npub1... or hex pubkey');
+  } catch (e) {
+    return alert('Bad recipient: ' + e.message);
+  }
+
+  // NIP-04: ECDH(my-priv, their-pub) -> shared secret -> AES-CBC encrypt(body)
+  // -> content = base64(ciphertext) + "?iv=" + base64(iv)
+  let ciphertext;
+  try {
+    ciphertext = await nip04.encrypt(state.privkey, recipHex, body);
+  } catch (e) {
+    addLog({ type:'error', summary:`NIP-04 encrypt failed: ${e.message}`, raw:{ recipient: recipHex, error: e.message } });
+    alert('Encrypt failed: ' + e.message + '\n\nUsually means a bad recipient pubkey.');
+    return;
+  }
+
+  const unsigned = {
+    kind: 4,
+    created_at: nowSec(),
+    tags: [['p', recipHex]],   // 'p' tag tells relays who the recipient is (visible plaintext!)
+    content: ciphertext
+  };
+  let signed;
+  try {
+    signed = finalizeEvent(unsigned, state.privkey);
+  } catch (e) {
+    addLog({ type:'error', summary:`finalizeEvent failed: ${e.message}`, raw:unsigned });
+    return;
+  }
+  if (!verifyEvent(signed)) {
+    addLog({ type:'error', summary:'verifyEvent failed — refusing to publish', raw:signed });
+    return;
+  }
+  publishEvent(signed);
+  document.getElementById('dm-content').value = '';
+});
+
+function publishEvent(signed) {
+  const msg = ['EVENT', signed];
+  let sent = 0;
+  for (const [url, r] of state.relays) {
+    if (r.ws && r.ws.readyState === WebSocket.OPEN) {
+      r.ws.send(JSON.stringify(msg));
+      sent++;
+      addLog({ type:'out', relay:url, summary:`EVENT kind=${signed.kind} id=${shortKey(signed.id)}`, raw:msg });
+    }
+  }
+  if (!sent) addLog({ type:'error', summary:'No open relays — nothing was published. Connect a relay in section 2.', raw:signed });
+}
+
+// ============================================================================
+// Subscribe presets
+// ============================================================================
+
+let subCounter = 0;
+function nextSubId() { return `sub-${++subCounter}`; }
+
+function publishSub(filters) {
+  const subId = nextSubId();
+  state.subs.set(subId, { filters });
+  const msg = ['REQ', subId, ...filters];
+  let sent = 0;
+  for (const [url, r] of state.relays) {
+    if (r.ws && r.ws.readyState === WebSocket.OPEN) {
+      r.ws.send(JSON.stringify(msg));
+      addLog({ type:'out', relay:url, summary:`REQ ${subId}`, raw:msg });
+      sent++;
+    }
+  }
+  if (!sent) addLog({ type:'error', summary:'No open relays — REQ not sent.', raw:msg });
+  renderActiveSubs();
+}
+
+document.querySelectorAll('.sub-preset').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const preset = btn.dataset.preset;
+    if (preset === 'my-events') {
+      if (!state.pubkey) return alert('Load key first.');
+      publishSub([{ kinds:[0,1,3,4,7], authors:[state.pubkey], limit:50 }]);
+    } else if (preset === 'my-dms') {
+      if (!state.pubkey) return alert('Load key first.');
+      publishSub([{ kinds:[4], '#p':[state.pubkey], limit:50 }]);
+    } else if (preset === 'lookup-author') {
+      const raw = prompt('Author npub or 64-char hex:');
+      if (!raw) return;
+      let hex;
+      try {
+        if (raw.startsWith('npub1')) {
+          const d = nip19.decode(raw.trim());
+          if (d.type !== 'npub') throw new Error('not an npub');
+          hex = d.data;
+        } else if (/^[0-9a-f]{64}$/i.test(raw.trim())) {
+          hex = raw.trim().toLowerCase();
+        } else throw new Error('bad input');
+      } catch (e) { return alert(e.message); }
+      publishSub([{ kinds:[0,1], authors:[hex], limit:30 }]);
+    } else if (preset === 'firehose') {
+      publishSub([{ kinds:[1], limit:20 }]);
+    }
+  });
+});
+
+document.getElementById('cancel-subs').addEventListener('click', () => {
+  for (const [subId] of state.subs) {
+    const msg = ['CLOSE', subId];
+    for (const [url, r] of state.relays) {
+      if (r.ws && r.ws.readyState === WebSocket.OPEN) {
+        r.ws.send(JSON.stringify(msg));
+        addLog({ type:'out', relay:url, summary:`CLOSE ${subId}`, raw:msg });
+      }
+    }
+  }
+  state.subs.clear();
+  renderActiveSubs();
+});
+
+function renderActiveSubs() {
+  const el = document.getElementById('active-subs');
+  if (!state.subs.size) { el.textContent = 'No active subscriptions.'; return; }
+  el.textContent = `Active subs: ${Array.from(state.subs.keys()).join(', ')}`;
+}
+renderActiveSubs();
+
+// ============================================================================
+// Misc
+// ============================================================================
+
+document.getElementById('clear-log').addEventListener('click', () => { logEl.innerHTML = ''; });
+
+addLog({ type:'system', summary:'Page loaded. Open the browser console (F12) to see all WebSocket traffic mirrored there.', raw:null });
+</script>
+</body>
+</html>

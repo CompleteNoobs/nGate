@@ -1,0 +1,73 @@
+# ─────────────────────────────────────────────────────────────────────
+# Example docker-compose.yml with nGate sidecar
+# ─────────────────────────────────────────────────────────────────────
+# This is the SAME stack from stage 1 (nostr-rs-relay + Caddy) plus a
+# third service: ngate-sync. Copy this file to /opt/nostr-relay/ on each
+# relay box, alongside config.toml + Caddyfile + ngate.yaml + seed.toml.
+# Adjust host-side paths if you deployed elsewhere.
+
+services:
+
+  # ─── 1. The relay itself (unchanged from stage 1) ─────────────────
+  nostr-relay:
+    image: scsibug/nostr-rs-relay:latest
+    container_name: nostr-relay
+    restart: unless-stopped
+    volumes:
+      - ./config.toml:/usr/src/app/config.toml:ro
+      - ./data:/usr/src/app/db
+    expose:
+      - "8080"
+    networks:
+      - relaynet
+
+  # ─── 2. TLS reverse proxy (unchanged from stage 1) ────────────────
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy_data:/data
+      - ./caddy_config:/config
+    depends_on:
+      - nostr-relay
+    networks:
+      - relaynet
+
+  # ─── 3. nGate sidecar (NEW in phase 3.5) ──────────────────────────
+  ngate-sync:
+    build:
+      context: .
+      dockerfile: scripts/Dockerfile
+    container_name: ngate-sync
+    restart: unless-stopped
+    volumes:
+      # Bind-mount the scripts dir so operator edits are picked up on
+      # `docker compose restart ngate-sync` without rebuilding the image.
+      - ./scripts:/app/scripts
+      # Operator-managed config + always-allowed pubkeys (read-only)
+      - ./ngate.yaml:/app/ngate.yaml:ro
+      - ./seed.toml:/app/seed.toml:ro
+      # Files nGate reads AND writes
+      - ./config.toml:/app/config.toml
+      - ./state.json:/app/state.json
+      # ⚠ Mount the host's docker socket so nGate can restart the relay
+      #    container after rewriting config.toml. Security note: this gives
+      #    the sidecar effective root on the host. Acceptable here because
+      #    the sidecar already writes config.toml (operator-trusted code);
+      #    not acceptable on a multi-tenant box.
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - NGATE_YAML=/app/ngate.yaml
+    depends_on:
+      - nostr-relay
+    networks:
+      - relaynet
+
+networks:
+  relaynet:
+    driver: bridge

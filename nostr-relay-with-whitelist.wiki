@@ -1,0 +1,600 @@
+{{:LICENCE_HEADER_MIT}}
+
+
+= Nostr Relay With a 3-Key Whitelist — Two Servers on Ubuntu 24.04 with Docker =
+
+From CompleteNoobs
+
+This guide walks through deploying '''two private Nostr relays''' from scratch on fresh Vultr Ubuntu 24.04 VPS boxes — one at <code>nostr.hive-book.com</code>, one at <code>nostr.v4call.com</code> — locked down so that only '''3 specific npub keys''' can publish events. The relays will serve over secure WebSocket (<code>wss://</code>) with auto-renewing Let's Encrypt certificates.
+
+This is a "noob doing Nostr by doing" walkthrough. If you have never run a Nostr relay before, you are in the right place. The same steps work for one relay or fifty — repeat Steps 1–14 for each box, just with a different domain name.
+
+'''End result''':
+* <code>wss://nostr.hive-book.com</code> — accepts events only from your 3 whitelisted keys
+* <code>wss://nostr.v4call.com</code> — accepts events only from your 3 whitelisted keys
+* Anyone in the world can ''read'' events from these relays; only your 3 keys can ''write'' to them
+* TLS certificates auto-renew, no manual fiddling
+
+== Quick Background — What is a Nostr Relay? ==
+
+If you are brand new to Nostr, here is the 60-second version:
+
+* '''Nostr''' = "Notes and Other Stuff Transmitted by Relays". A simple decentralised protocol — no blockchain, no accounts to register, no central server.
+* '''Identity''' is just a public key (an "npub", e.g. <code>npub1abc...xyz</code>). You sign your messages ("events") with your private key ("nsec"). Anyone can verify the signature with your npub.
+* '''Relays''' are dumb servers that store and forward signed events. They do not own your identity. If one relay bans you, you publish to a different one. Your followers' clients query multiple relays and merge the results.
+* '''Why run your own relay?''' Independence. Censorship-resistance. Speed. And — for this guide — the ability to run a ''private'' relay where only you (and your 2 friends, business partners, family — whoever holds the 3 whitelisted keys) can publish.
+
+A "whitelisted-write, public-read" relay is a great starter project. Outsiders can't spam it; you and your trusted keys can post freely; the world can still read your events if they know the relay URL. It's also useful infrastructure for v4call's federation discovery layer (see [[V4call]]).
+
+== Contents ==
+
+* [[#What_You_Need|1 What You Need]]
+* [[#Step_1:_Get_Your_3_Whitelisted_npubs_Ready|2 Step 1: Get Your 3 Whitelisted npubs Ready]]
+* [[#Step_2:_Convert_npub_to_hex|3 Step 2: Convert npub to hex]]
+* [[#Step_3:_Create_Your_Vultr_VPS_(x2)|4 Step 3: Create Your Vultr VPS (x2)]]
+* [[#Step_4:_Point_Your_Domains_at_the_VPS_Boxes|5 Step 4: Point Your Domains at the VPS Boxes]]
+* [[#Step_5:_Log_into_Your_VPS|6 Step 5: Log into Your VPS]]
+* [[#Step_6:_Update_and_Secure_the_Server|7 Step 6: Update and Secure the Server]]
+* [[#Step_7:_Install_Docker|8 Step 7: Install Docker]]
+* [[#Step_8:_Open_the_Firewall|9 Step 8: Open the Firewall]]
+* [[#Step_9:_Create_the_Relay_Project_Folder|10 Step 9: Create the Relay Project Folder]]
+* [[#Step_10:_Write_the_Relay_Config|11 Step 10: Write the Relay Config (config.toml)]]
+* [[#Step_11:_Write_the_Caddy_Config|12 Step 11: Write the Caddy Config (Caddyfile)]]
+* [[#Step_12:_Write_the_docker-compose.yml|13 Step 12: Write the docker-compose.yml]]
+* [[#Step_13:_Start_It_Up|14 Step 13: Start It Up]]
+* [[#Step_14:_Test_the_Relay|15 Step 14: Test the Relay]]
+* [[#Step_15:_Repeat_for_the_Second_Server|16 Step 15: Repeat for the Second Server]]
+* [[#Updating_the_Whitelist|17 Updating the Whitelist]]
+* [[#Common_Problems_and_Fixes|18 Common Problems and Fixes]]
+* [[#Tips_for_Nostr_Noobs|19 Tips for Nostr Noobs]]
+
+== What You Need ==
+
+* '''A Vultr account''' — sign up at [https://vultr.com vultr.com]. Please use our [https://www.vultr.com/?ref=7704739 Vultr Referral link] to help cover server costs.
+* '''Two domain names (or subdomains)''' with DNS access — for this guide: <code>nostr.hive-book.com</code> and <code>nostr.v4call.com</code>. Substitute your own.
+* '''Three Nostr key pairs''' — the 3 npubs that will be allowed to publish. If you don't have them yet, see Step 1.
+* '''A terminal''' — Mac: Terminal. Windows: PowerShell or PuTTY. Linux: whatever you've got.
+* '''Around 30–45 minutes''' per server — most of which is waiting for DNS, apt updates, and Docker pulls.
+
+You do not need to know Rust, Go, or any programming. Every command can be copy-pasted exactly as shown.
+
+== Step 1: Get Your 3 Whitelisted npubs Ready ==
+
+You need 3 Nostr public keys (npubs). These are the only keys that will be allowed to publish events to your relays.
+
+If you don't have them yet, generate them. Pick whichever method you like:
+
+;Option A — Browser-only generator (recommended, no install)
+:If you have v4call cloned, open <code>public/nostr-gen.html</code> in any browser. It generates an npub + nsec entirely in the browser using <code>window.crypto.subtle</code>. The keys never touch a network.
+:Save the npub (public, fine to share) and the nsec (private, NEVER share, treat like a posting key).
+
+;Option B — Use a Nostr client you already use
+:Damus, Amethyst, Iris, nos2x, Alby, etc. all let you export your npub. Settings → Profile → Public key.
+
+;Option C — Command-line with <code>nak</code>
+:Install [https://github.com/fiatjaf/nak nak]: <code>go install github.com/fiatjaf/nak@latest</code>
+:Then run <code>nak key generate</code> to make a new pair.
+
+'''⚠ Do this 3 times if you need 3 fresh pairs.''' Or use existing keys you already trust — the 3 don't have to be new.
+
+Write down the 3 npubs in a notes file. Example:
+
+ npub1aaaa...    (your daily key)
+ npub1bbbb...    (a partner's key)
+ npub1cccc...    (your v4call server's identity key)
+
+== Step 2: Convert npub to hex ==
+
+'''Important''': Nostr relays internally use the '''hex''' form of public keys, not the bech32 npub form. Same key, different encoding. <code>nostr-rs-relay</code>'s whitelist needs the hex.
+
+;Easiest converter — nostr-gen.html
+:If you generated keys via <code>nostr-gen.html</code>, the page already shows both forms. Copy the hex.
+
+;Web converter
+:[https://nostrcheck.me/converter/ nostrcheck.me/converter] — paste npub, get hex. (Use any reputable converter; the math is public.)
+
+;Command-line
+:With nak: <code>nak decode npub1aaaa...</code> — prints the hex pubkey.
+:With Python: <code>pip install bech32</code>, then a 3-line script. (Out of scope here.)
+
+You should end up with 3 hex strings, each 64 characters long (lowercase, 0-9 and a-f only). Example:
+
+ npub1aaaa...    →    abc123def456...   (64 hex chars)
+ npub1bbbb...    →    fff789abc012...   (64 hex chars)
+ npub1cccc...    →    111aaa222bbb...   (64 hex chars)
+
+Save these. You will paste them into <code>config.toml</code> in Step 10.
+
+'''💡 Tip''': If the converter spits out anything other than 64 hex chars, you pasted the wrong thing (probably an nsec — that's the private key, never paste it into a converter you don't fully trust). Double-check the input started with <code>npub1</code>, not <code>nsec1</code>.
+
+== Step 3: Create Your Vultr VPS (x2) ==
+
+You need '''two''' VPS boxes — one for each relay. Repeat this step twice. Name them differently (e.g. <code>nostr-hivebook</code> and <code>nostr-v4call</code>) so you don't confuse them later.
+
+# Log into [https://my.vultr.com my.vultr.com]
+# Click '''Deploy New Server'''
+# Choose '''Cloud Compute — Shared CPU'''
+# Choose a location close to where most of your readers are
+# Choose '''Ubuntu 24.04 LTS x64'''
+# Choose the '''$6/month''' plan (1 CPU, 1GB RAM, 25GB SSD) — plenty for a private relay with 3 publishers
+# Set Server Hostname to something like <code>nostr-hivebook</code>
+# Click '''Deploy Now'''
+
+Wait ~60 seconds for it to start. Click the server to find:
+* '''IP Address''' — looks like <code>123.456.789.012</code> — write it down
+* '''Password''' — click the eye icon — write it down
+
+Repeat for the second server. Now you should have:
+
+ nostr-hivebook    →   IP_A   password_A
+ nostr-v4call      →   IP_B   password_B
+
+'''💡 Tip''': $6/month per relay is fine for low-traffic private relays. If your 3 keys post infrequently and the world reads occasionally, you'll never hit any limits. If you want to be cheap, $3.50/month boxes also work (512MB RAM) but pulls/builds are slower.
+
+== Step 4: Point Your Domains at the VPS Boxes ==
+
+Log into your DNS provider for each domain and add an '''A''' record:
+
+;For <code>nostr.hive-book.com</code>
+:{| class="wikitable"
+|-
+! Field !! Value
+|-
+| Type || A
+|-
+| Name || <code>nostr</code>
+|-
+| Value || IP_A (the hive-book VPS)
+|-
+| TTL || 300
+|}
+
+;For <code>nostr.v4call.com</code>
+:Same setup, but Name = <code>nostr</code>, Value = IP_B (the v4call VPS).
+
+DNS takes a few minutes to propagate. From your computer:
+
+ nslookup nostr.hive-book.com
+ nslookup nostr.v4call.com
+
+Each must show the correct VPS IP before Step 13 (Caddy needs the DNS to resolve to fetch a certificate). You can continue with the other steps while waiting.
+
+== Step 5: Log into Your VPS ==
+
+Open a terminal:
+
+ ssh root@IP_A
+
+Type <code>yes</code> at the fingerprint prompt, then paste the password from Vultr (right-click to paste in most terminals).
+
+If Vultr forces a password change on first login, set a strong new one and write it down.
+
+'''Repeat the rest of this guide on both boxes.''' We'll do them one at a time. Steps 6–14 are identical on both — only the domain name in Step 11 (Caddyfile) changes.
+
+== Step 6: Update and Secure the Server ==
+
+Always start with a system update:
+
+ apt update && apt upgrade -y
+
+This may take a few minutes. If it asks about restarting services, hit Enter to accept defaults.
+
+'''Optional but recommended — make a non-root user''' (you can skip if you're the only person ever touching this box and you trust your password):
+
+ adduser nostr
+ usermod -aG sudo nostr
+
+Then later you can <code>ssh nostr@IP_A</code> and <code>sudo</code> for privileged commands. For this guide we'll just stay as root for simplicity — fine for a single-purpose box.
+
+== Step 7: Install Docker ==
+
+Install Docker the official way:
+
+ apt install -y ca-certificates curl
+ install -m 0755 -d /etc/apt/keyrings
+ curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+ chmod a+r /etc/apt/keyrings/docker.asc
+ echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
+ apt update
+ apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+Verify:
+
+ docker --version
+ docker compose version
+
+You should see version numbers for both. If not, re-run the apt install line.
+
+'''💡 Tip''': <code>docker compose</code> (with a space) is the new way. The old <code>docker-compose</code> (with a hyphen) is deprecated. This guide uses the new form.
+
+== Step 8: Open the Firewall ==
+
+Vultr boxes start with no firewall, but it's good hygiene to enable one. We need ports 22 (SSH), 80 (HTTP, for Let's Encrypt), and 443 (HTTPS/WSS).
+
+ ufw allow 22/tcp
+ ufw allow 80/tcp
+ ufw allow 443/tcp
+ ufw --force enable
+ ufw status
+
+You should see all three ports listed as ALLOW.
+
+'''⚠ Important''': do NOT skip port 80. Caddy uses HTTP-01 ACME challenges to get the TLS certificate, which needs port 80 reachable from the internet. Closing it = no certificate = no <code>wss://</code>.
+
+== Step 9: Create the Relay Project Folder ==
+
+ mkdir -p /opt/nostr-relay
+ cd /opt/nostr-relay
+ mkdir -p data caddy_data caddy_config
+
+You'll create three files in <code>/opt/nostr-relay</code>:
+* <code>config.toml</code> — relay configuration (whitelist lives here)
+* <code>Caddyfile</code> — TLS reverse proxy config (domain name lives here)
+* <code>docker-compose.yml</code> — orchestration
+
+== Step 10: Write the Relay Config (config.toml) ==
+
+We'll use [https://github.com/scsibug/nostr-rs-relay nostr-rs-relay] — a battle-tested Rust relay with a simple TOML config and a built-in pubkey whitelist (no plugins, no extra daemon).
+
+Create the config file:
+
+ nano /opt/nostr-relay/config.toml
+
+Paste this — '''replace the three hex strings''' in <code>pubkey_whitelist</code> with the 3 hex pubkeys from Step 2:
+<!-- use pre tags or it breaks wiki syntax -->
+
+<pre>
+ [info]
+ relay_url = "wss://nostr.hive-book.com/"
+ name = "hive-book private relay"
+ description = "Private write-whitelisted relay. Public read."
+ # pubkey of the relay operator (hex). Optional but nice.
+ # pubkey = "your-operator-hex-pubkey"
+ # contact = "mailto:you@example.com"
+
+ [database]
+ data_directory = "/usr/src/app/db"
+
+ [network]
+ # Bind inside the container; Caddy will reverse-proxy from the public 443.
+ address = "0.0.0.0"
+ port = 8080
+
+ [limits]
+ messages_per_sec = 10
+ subscriptions_per_min = 30
+ max_event_bytes = 131072      # 128 KB per event — plenty for normal Nostr use
+ max_ws_message_bytes = 131072
+ max_ws_frame_bytes = 131072
+ broadcast_buffer = 1024
+ event_persist_buffer = 16
+
+ [authorization]
+ # ONLY these hex pubkeys can publish (write) events.
+ # Reading is open to anyone in the world.
+ pubkey_whitelist = [
+   "REPLACE_WITH_HEX_OF_NPUB_1",
+   "REPLACE_WITH_HEX_OF_NPUB_2",
+   "REPLACE_WITH_HEX_OF_NPUB_3",
+ ]
+
+ [verified_users]
+ mode = "disabled"
+
+ [retention]
+ # Keep everything forever for a private relay. Tweak if you want.
+ # max_events = 0
+ # max_bytes = 0
+</pre>
+Save with <code>Ctrl+O</code>, Enter, then <code>Ctrl+X</code> to exit nano.
+
+'''⚠ Important — read this twice, it's the #1 mistake''':
+* '''The whitelist is the HEX form of the pubkey, NEVER the npub form.''' Lowercase, exactly 64 characters, only digits 0-9 and letters a-f. Pasting <code>npub1abc...</code> values here is a silent disaster — the relay starts fine and accepts connections fine, but every single EVENT you publish gets rejected with <code>OK accepted=false reason="blocked: pubkey is not allowed to publish to this relay"</code>, because no pubkey in the world will ever match those bech32 strings. You won't see this until you try to publish, and even then it's a confusing error that looks like ''you'' did something wrong.
+* '''If you skipped Step 2, go back and do it now.''' Step 2 is specifically about converting npub → hex for this exact purpose. The conversion is deterministic — same key, just different encoding. <code>nak decode npub1...</code> on your laptop prints the hex; or use <code>nostr-gen.html</code> in the v4call repo (the public hex pubkey is shown right under the npub, with a copy button).
+* '''Sanity check before saving''': every entry between the quotes should be exactly 64 characters, all lowercase, all hex. Count if you have to. <code>npub1...</code> values are roughly 63 characters and contain non-hex letters like <code>z</code>, <code>p</code>, <code>j</code> — instant red flag.
+* '''If you typo a hex character (63 chars, or a stray <code>g</code>-<code>z</code>), the relay refuses to start.''' Check <code>docker compose logs nostr-relay</code> for the parse error. ''But pasting valid-looking npubs starts cleanly and silently rejects every publish'' — that's the bigger trap.
+* '''For the second server, change <code>relay_url</code> and <code>name</code> to the v4call values, but the whitelist stays the same.'''
+
+'''💡 Tip''': nostr-rs-relay also supports paid-relay mode and NIP-42 AUTH gating. For "just whitelist 3 keys", <code>pubkey_whitelist</code> is the simplest mechanism. The relay will reject any incoming EVENT whose <code>pubkey</code> field isn't in this list, with a clear NOTICE back to the client.
+
+== Step 11: Write the Caddy Config (Caddyfile) ==
+
+[https://caddyserver.com Caddy] is a reverse proxy that auto-fetches and auto-renews Let's Encrypt certificates. It's much simpler than nginx + certbot for a single-purpose box.
+
+Create the Caddyfile — '''use the correct domain for this server''' (hive-book.com on the first box, v4call.com on the second):
+
+ nano /opt/nostr-relay/Caddyfile
+
+Paste (for the first server):
+<pre>
+ nostr.hive-book.com {
+   # WebSocket reverse proxy to the relay container on port 8080.
+   reverse_proxy nostr-relay:8080
+
+   # Friendly response if someone hits the URL in a normal browser.
+   @browser {
+     not header Connection *Upgrade*
+     not path /
+   }
+
+   # Optional: log access. Comment out to disable.
+   log {
+     output file /data/access.log
+     format console
+   }
+ }
+</pre>
+Save and exit.
+
+For the second box, the only change is the first line:
+
+ nostr.v4call.com {
+   reverse_proxy nostr-relay:8080
+   ...
+ }
+
+Caddy will see this file, fetch a Let's Encrypt cert for the domain on first start, and auto-renew it forever. Zero manual cert work.
+
+'''💡 Tip''': Caddy stores its cert state in <code>/data</code> inside the container — we mount that to <code>./caddy_data</code> on the host so the cert survives container restarts. Don't delete that folder unless you want Caddy to re-issue from scratch.
+
+== Step 12: Write the docker-compose.yml ==
+
+ nano /opt/nostr-relay/docker-compose.yml
+
+Paste:
+<pre>
+ services:
+   nostr-relay:
+     image: scsibug/nostr-rs-relay:latest
+     container_name: nostr-relay
+     restart: unless-stopped
+     volumes:
+       - ./config.toml:/usr/src/app/config.toml:ro
+       - ./data:/usr/src/app/db
+     expose:
+       - "8080"
+     networks:
+       - relaynet
+
+   caddy:
+     image: caddy:2-alpine
+     container_name: caddy
+     restart: unless-stopped
+     ports:
+       - "80:80"
+       - "443:443"
+     volumes:
+       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+       - ./caddy_data:/data
+       - ./caddy_config:/config
+     depends_on:
+       - nostr-relay
+     networks:
+       - relaynet
+
+ networks:
+   relaynet:
+     driver: bridge
+</pre>
+Save and exit.
+
+What this does:
+* '''nostr-relay''' container runs the Rust relay, reads <code>config.toml</code>, persists its SQLite DB to <code>./data</code> on the host. Not exposed to the public — only Caddy talks to it on the internal Docker network.
+* '''caddy''' container holds the public ports (80, 443), terminates TLS, and reverse-proxies WebSocket traffic to the relay. Persists certificates to <code>./caddy_data</code>.
+
+== Step 13: Start It Up ==
+
+From <code>/opt/nostr-relay</code>:
+
+ docker compose pull
+ docker compose up -d
+
+Watch the logs for a minute:
+
+ docker compose logs -f
+
+You should see:
+* nostr-relay: <code>relay starting on 0.0.0.0:8080</code> (or similar)
+* caddy: a line about obtaining a certificate for <code>nostr.hive-book.com</code> via the ACME challenge, then a successful <code>certificate obtained</code> line.
+
+Press <code>Ctrl+C</code> to stop tailing logs. The containers keep running.
+
+'''⚠ If you see <code>ERROR r2d2: unable to open database file: /usr/src/app/db/nostr.db</code>''' (looping every few seconds in the <code>nostr-relay</code> logs):
+
+This is the most common first-run snag. The <code>scsibug/nostr-rs-relay</code> container runs as a non-root user (UID 100) inside the container, but your <code>./data</code> directory on the host was created by <code>root</code> in Step 9 — so the container user can't write to it. SQLite refuses to create the DB file, the relay loops, and Caddy proxies start returning 502.
+
+'''Quick fix (just unblock me)''' — works on any image, any version, fine for a single-purpose box where the data dir holds only public Nostr events:
+
+ cd /opt/nostr-relay
+ docker compose down
+ chmod -R 777 /opt/nostr-relay/data
+ docker compose up -d
+ docker compose logs -f nostr-relay
+
+You should now see:
+
+ INFO nostr_rs_relay::repo::sqlite: Built a connection pool "writer" (min=0, max=2)
+ INFO nostr_rs_relay::repo::sqlite: Built a connection pool "reader" (min=0, max=8)
+
+…and '''no more''' <code>r2d2: unable to open database file</code> errors. Press <code>Ctrl+C</code> to stop tailing.
+
+'''Tighter fix (chown to the correct UID)''' — recommended once you've confirmed the relay works. The image uses an <code>appuser</code> created by the base image, but the exact UID can change between image releases — '''don't trust a hardcoded number from a guide, ask the image''':
+
+ # Find out what UID the container actually runs as:
+ docker run --rm scsibug/nostr-rs-relay:latest id
+ # Example output:  uid=1000(appuser) gid=1000(appuser) groups=1000(appuser)
+
+Take the UID and GID from that output (let's say both are 1000) and apply them to the data directory:
+
+ cd /opt/nostr-relay
+ docker compose down
+ chmod -R 755 /opt/nostr-relay/data       # back to sensible perms
+ chown -R 1000:1000 /opt/nostr-relay/data  # use YOUR numbers from above
+ docker compose up -d
+ docker compose logs -f nostr-relay
+
+If logs are clean, the chown stuck and you're now running with proper UID alignment instead of world-writable.
+
+'''💡 Why does this happen?''' The relay's image creates a non-root <code>appuser</code> and switches to it before running — good security hygiene (the container can't run as root even if exploited). The cost is that any host-mounted volume needs to be writable by ''that exact UID''. The host's <code>./data</code> folder was created by <code>root</code> in Step 9, so by default the container user can't write to it. Same pattern v4call uses (UID 1000 there) — Docker bind-mounts always need host-side permissions matching the container-side user.
+
+'''💡 Will this break on image updates?''' Usually not — the UID is baked into the image and stays stable across patch releases. But if you ever <code>docker compose pull</code> a new image and the relay starts erroring on the DB again, re-run <code>docker run --rm scsibug/nostr-rs-relay:latest id</code> to check whether the UID changed, and re-chown if it did.
+
+'''💡 Why not just always use <code>chmod 777</code>?''' For a private 3-key relay storing public events, it's genuinely fine — the data is signed-and-public by design and the box is single-purpose. The <code>chown</code> approach is just hygiene that pays off if the box ever ends up serving more than one thing.
+
+'''💡 Ignore the <code>502</code> lines from random IPs''' (e.g. <code>monitor-telegram-clone-realtime/1.0</code>, IPs you don't recognise). Within minutes of a fresh domain getting a Let's Encrypt cert, internet-wide scanners hit it. They get a 502 while the relay is broken and a normal HTTP response (or WebSocket upgrade) once it's working. Not an attack, not anything to fix — just background noise of the public internet. <code>ufw</code> + the whitelist + Caddy's TLS handshake are doing their jobs.
+
+'''⚠ If Caddy can't get a certificate''':
+* DNS for the domain isn't pointing to this VPS yet → wait, run <code>nslookup nostr.hive-book.com</code> from a different machine, confirm it resolves to your IP.
+* Port 80 is closed → re-check Step 8.
+* Caddy logs will tell you the exact ACME failure reason. Read them.
+
+== Step 14: Test the Relay ==
+
+;Test 1 — Is the WebSocket reachable?
+:You need a tiny WebSocket client on your laptop. Pick whichever is easiest for your OS:
+
+;'''Option 1A — websocat prebuilt binary (any Linux, no compilation)'''
+:Skip <code>cargo install websocat</code> on Ubuntu 24.04 — its apt-shipped Rust 1.75 is too old to compile current websocat, and you'll waste 10 minutes downloading half of crates.io before hitting an <code>edition2024</code> error. Grab the prebuilt static binary instead:
+: <code>sudo wget -O /usr/local/bin/websocat https://github.com/vi/websocat/releases/latest/download/websocat.x86_64-unknown-linux-musl</code>
+: <code>sudo chmod +x /usr/local/bin/websocat</code>
+: <code>websocat --version</code>
+
+;'''Option 1B — wscat (Node.js, simpler if you already have npm)'''
+: <code>sudo apt install -y npm && sudo npm install -g wscat</code>
+:Then use <code>wscat -c wss://...</code> instead of <code>websocat wss://...</code> in the steps below. wscat prints a "Connected" banner so it's friendlier than websocat for first-time testing.
+
+;'''Option 1C — nak (Go, the Nostr-native option, also handy for Steps 1 + 2)'''
+:Install Go from apt and use it to build nak:
+: <code>sudo apt install -y golang-go</code>
+: <code>go install github.com/fiatjaf/nak@latest</code>
+: <code>echo 'export PATH=$PATH:$HOME/go/bin' >> ~/.bashrc && source ~/.bashrc</code>
+: <code>nak --help</code>      # confirm it's on PATH
+:Then skip websocat/wscat entirely:
+: <code>nak req -k 1 wss://nostr.hive-book.com</code>
+:Prints any matching events and exits. Done. nak also does npub/hex conversion (<code>nak decode npub1...</code>) and signing (<code>nak event --sec ...</code>) — see Step 1 and the bonus test at the end of Step 14.
+:'''💡 Tip''': if <code>nak --help</code> says "command not found" after install, your shell hasn't reloaded PATH. Either open a new terminal or run <code>export PATH=$PATH:$HOME/go/bin</code> in the current one.
+
+;'''Option 1D — Mac users'''
+: <code>brew install websocat</code> just works.
+
+Once you have one of the above, connect:
+
+ websocat -v wss://nostr.hive-book.com/
+   # or:  wscat -c wss://nostr.hive-book.com/
+
+'''⚠ websocat's silent connection trips up first-time users.''' Without the <code>-v</code> flag, websocat opens the WebSocket and just sits there with a blank cursor — no "Connected!" banner, no prompt, nothing. That's '''not''' a hang, that's a working connection waiting for you to type. The <code>-v</code> flag in the command above prints lifecycle messages like <code>get_ws_client_peer</code> so you can see it actually connected. (wscat is friendlier — it prints "Connected (press CTRL+C to quit)".)
+
+Once connected (silent or banner, doesn't matter), paste this exact line:
+
+ ["REQ","test",{"kinds":[1],"limit":1}]
+
+Press Enter. The relay will respond with <code>["EOSE","test"]</code> (end of stored events) — meaning it's alive and there's nothing stored yet. Press <code>Ctrl+C</code> to disconnect.
+
+'''💡 If you got nothing back''' after typing the REQ — there's actually a stored event somewhere on this relay (so the response would be a JSON event line then EOSE), or the relay is alive but rejecting your REQ for some reason. Run with <code>nak req -k 1 wss://...</code> instead to get a clearer view of what's happening. Or check <code>docker compose logs nostr-relay</code> on the server side for what it received.
+
+'''💡 <code>["NOTICE","could not parse command"]</code> is also a "working" signal.''' If you accidentally hit Enter on a blank line, type plain English, or paste anything that isn't valid Nostr JSON, the relay replies with a NOTICE rejection. That's '''good news''' — it proves the relay parsed your input and pushed back. A truly broken relay would either disconnect or stay silent. So if you mistype the REQ command and see a NOTICE come back, just paste the correct JSON and try again.
+
+'''💡 You don't actually have to type anything to confirm Test 1 passed.''' The verbose output from <code>websocat -v</code> already tells you everything you need:
+
+ [INFO  websocat::net_peer] Connected to TCP <vps-ip>:443
+ [INFO  websocat::ws_client_peer] Connected to ws, response headers: Headers { ...
+   Server: Caddy
+   Upgrade: websocket
+ }
+
+The TCP-on-443 line + the <code>Upgrade: websocket</code> header + <code>Server: Caddy</code> together prove: DNS resolved, TLS handshake completed, Caddy accepted the connection, the WebSocket upgrade succeeded, the relay is on the other end. If you see those, you can <code>Ctrl+C</code> right there — Test 1 is already a pass. Typing the REQ is just an extra "and it speaks Nostr" sanity check on top.
+
+'''💡 Tip''': you can also test purely from a browser. Open your client of choice (e.g. [https://nostrudel.ninja nostrudel.ninja]) and add <code>wss://nostr.hive-book.com</code> as a custom relay. If it connects without TLS errors, the relay is reachable. The browser console (F12) will show the WebSocket open/close lifecycle.
+
+;Test 2 — Whitelist actually rejects strangers
+:From any Nostr client logged in with a key that is '''NOT''' in your whitelist, try posting a note and add <code>wss://nostr.hive-book.com/</code> as a relay. The relay should respond with an OK=false NOTICE explaining the pubkey isn't allowed. Look at <code>docker compose logs nostr-relay</code> — you'll see the rejection logged.
+
+;Test 3 — Whitelisted key CAN publish
+:Use a Nostr client logged in with one of your 3 whitelisted keys. Add the relay. Post a short note. Run Test 1's REQ command again — this time you should see the event come back.
+
+If all three tests pass, your first relay is live. 🎉
+
+;Bonus test with <code>nak</code>
+:If you have nak installed, you can publish straight from the command line:
+: <code>nak event --sec YOUR_NSEC_HEX -c "hello private relay" wss://nostr.hive-book.com</code>
+:And query:
+: <code>nak req -k 1 wss://nostr.hive-book.com</code>
+
+== Step 15: Repeat for the Second Server ==
+
+Log out, ssh into the v4call box (<code>ssh root@IP_B</code>), and repeat Steps 6 through 14 with these tweaks:
+
+* Step 10 — <code>relay_url</code> and <code>name</code> in <code>config.toml</code> use the v4call domain.
+* Step 11 — first line of the Caddyfile is <code>nostr.v4call.com {</code>.
+
+The 3-key whitelist stays identical on both boxes — that's the whole point: same 3 keys can publish to either relay, and you have geographic / provider redundancy in case one box has an issue.
+
+When you're done, both <code>wss://nostr.hive-book.com</code> and <code>wss://nostr.v4call.com</code> answer to the same 3 keys.
+
+== Updating the Whitelist ==
+
+To add or remove a key:
+
+# SSH into the box.
+# <code>nano /opt/nostr-relay/config.toml</code> and edit the <code>pubkey_whitelist</code> array.
+# <code>cd /opt/nostr-relay && docker compose restart nostr-relay</code>
+
+The relay restarts in a couple of seconds. Caddy keeps running — no certificate work needed for a config tweak.
+
+Repeat on the second box if you want both relays in sync.
+
+'''💡 Tip''': make this a habit — keep the 3 hex pubkeys in a notes file outside the server too. When you rotate a key, update the notes file ''and'' both relays.
+
+== Common Problems and Fixes ==
+
+;'''Caddy: "no domains qualify for managed certificates"'''
+:DNS not pointing to the box yet, or pointing to the ''wrong'' box. Run <code>nslookup yourdomain</code> from a third location. If it shows the wrong IP, fix DNS and wait 5 minutes.
+
+;'''Caddy: "context deadline exceeded" / "connection refused" on ACME challenge'''
+:Port 80 is firewalled. Re-check <code>ufw status</code>. Also make sure no other process is on port 80 (<code>ss -tlnp | grep ':80'</code>).
+
+;'''Relay logs: "invalid pubkey in whitelist"'''
+:Your hex string isn't 64 lowercase hex characters. Common mistake: pasting the npub instead of the hex; or leaving in a stray space; or accidentally pasting an nsec. Reconvert from npub → hex (Step 2) and paste again.
+
+;'''Every publish gets <code>OK accepted=false reason="blocked: pubkey is not allowed to publish to this relay"</code> even though I added my key'''
+:'''99% of the time''': you pasted <code>npub1...</code> values into <code>pubkey_whitelist</code> instead of the 64-char hex form. The relay starts cleanly with npubs (it's just a string list to TOML) but ''no'' real pubkey ever matches a bech32 string, so every publish silently rejects.
+:Fix: convert each npub to hex on your laptop —
+: <code>nak decode npub1abc... | jq -r .pubkey</code>
+:or open <code>nostr-gen.html</code> from the v4call repo (the hex pubkey is now displayed under the npub with a copy button). Replace every entry in <code>pubkey_whitelist</code> with the hex form, then:
+: <code>cd /opt/nostr-relay && docker compose restart nostr-relay</code>
+:Watch <code>docker compose logs -f nostr-relay</code> while you re-publish from your client — the rejection line shows exactly which hex pubkey the relay is checking against; you can compare it character-by-character to <code>config.toml</code>. If they don't match, the wrong key got loaded into your client (or the wrong hex into the config).
+:Edge cases that cause the same error: case mismatch (whitelist must be lowercase), a stray trailing space inside the quotes, or you edited <code>config.toml</code> on one box but not the other. Always check both.
+
+;'''Whitelisted client gets rejected anyway'''
+:Almost always: the client signed the event with a different key than you put on the whitelist (e.g. you converted the wrong npub, or you have multiple identities in your client). In the client, verify which key is actively signing, get its npub, convert again, compare to <code>config.toml</code>.
+
+;'''<code>websocat wss://...</code> says "TLS handshake error"'''
+:Caddy hasn't finished provisioning the certificate yet. Wait 30 seconds and try again. If it persists for >5 minutes, check <code>docker compose logs caddy</code>.
+
+;'''<code>cargo install websocat</code> fails with <code>feature 'edition2024' is required</code>'''
+:Ubuntu 24.04's apt cargo (1.75) is too old to compile current websocat. Don't try to upgrade Rust just for this — grab the prebuilt static binary instead (Test 1, Option 1A in Step 14). Or use <code>wscat</code> via npm. Or skip ahead to <code>nak</code>.
+
+;'''<code>websocat: command not found</code> after a failed install'''
+:The cargo install errored before it could place the binary. Use Option 1A (prebuilt binary to <code>/usr/local/bin</code>) instead.
+
+;'''<code>r2d2: unable to open database file</code> looping in nostr-relay logs (and Caddy returning 502)'''
+:UID mismatch on the bind-mounted data directory. The container runs as a non-root <code>appuser</code>; your <code>./data</code> folder is owned by root. Quick fix: <code>docker compose down && chmod -R 777 /opt/nostr-relay/data && docker compose up -d</code> (fine for a single-purpose box). Tighter fix: find the image's actual UID via <code>docker run --rm scsibug/nostr-rs-relay:latest id</code>, then <code>chown -R UID:GID /opt/nostr-relay/data</code>. See the inline note at the end of Step 13 for the full explanation.
+
+;'''Container keeps restarting'''
+:<code>docker compose logs --tail=50 nostr-relay</code> — almost always a config.toml syntax error (missing quote, unclosed bracket). Fix and <code>docker compose up -d</code>.
+
+;'''Disk filling up over time'''
+:Check <code>du -sh /opt/nostr-relay/data</code>. If you're storing kind 1 notes from 3 active users and never deleting, it grows slowly (megabytes per year). If it grows fast, something is wrong (a whitelisted key is firehosing) — investigate the events table.
+
+== Tips for Nostr Noobs ==
+
+* '''npub vs nsec''': npub starts with <code>npub1</code>, is your public identity, share freely. nsec starts with <code>nsec1</code>, is your private signing key, '''never paste it anywhere except your own client''' (and ideally only via a hardware-isolated tool like a browser extension or a hardware signer). If you ever paste an nsec into a website you don't fully trust, treat that key as compromised and rotate.
+* '''There is no "delete" on Nostr''' — events are signed objects relays store. NIP-09 has a "delete request" event, but relays may or may not honour it, and other relays will still have copies. Treat anything you publish as permanent.
+* '''Public read, private write is a useful pattern''' — what you've built. People can ''see'' what your 3 keys publish (great for credibility, transparency, archive value) but can't pollute your relay with their own stuff.
+* '''Federation note for v4call operators''': the v4call NOSTR-DESIGN-NOTES.md (in the v4call repo) describes a server-level identity (per-server keypair + <code>kind:30078</code> announce events). One natural pattern: the third whitelisted key on your relay is your v4call ''server's'' Nostr identity, while the other two are your personal + a partner's. The relay then doubles as v4call federation discovery infrastructure.
+* '''Backups''': back up <code>/opt/nostr-relay/data</code> (the SQLite DB). The Caddy cert volume can be re-issued from Let's Encrypt at any time, so it's less critical, but no harm in including it.
+* '''Costs''': $6/month per Vultr box × 2 = $12/month. Domain renewal is the only other cost. No platform fees, no per-event charges.
+* '''Want to learn more?''' Read [https://github.com/nostr-protocol/nips the NIPs] (Nostr Implementation Possibilities) — they're short, readable specs. NIP-01 is the protocol core. NIP-11 is relay information documents (worth implementing later via <code>relay_info</code> in config.toml). NIP-42 is AUTH (a more sophisticated alternative to a flat whitelist).
+* '''Test client''': [https://nostrudel.ninja nostrudel.ninja] is a clean web client that lets you add custom relays per account. Great for poking at your own relay without committing to a heavy app.
+
+You now have two private, whitelisted Nostr relays. Welcome to running your own Nostr infrastructure. 🌿
