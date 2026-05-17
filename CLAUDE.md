@@ -40,9 +40,8 @@ upcoming Nostr layer (planned v0.18.5+). The full picture:
     handshake code — see "Locked-in design decisions" below.**
   - `server-announce.html` — publishes the `v4call-server` directory post on
     Hive. Paste-signed-JSON workflow extracts fields + attestation from a
-    server-sign output. **Currently has a bug ("Nostr key declared but no
-    attestation loaded" misfiring even when the paste card was used) — see
-    STATUS.md.**
+    server-sign output. Paste-card validator bug (attestation misfire on
+    broadcast) fixed 2026-05-13.
   - `rate-editor.html` — generates `[V4CALL-RATES-V2]` body for user-tier
     rates posts. Embeds a kind-30078 Nostr attestation (different d-tag from
     server-tier).
@@ -241,9 +240,27 @@ Adopted across all 5 nGate scripts:
   `lib/ngate-verify-nostr-event.mjs` uses `.mjs` extension so Node treats it
   as ESM regardless of `package.json` `"type"` field. Don't rename to `.js`
   without also adding `"type": "module"` or wrapping in `import()`.
-- **server-announce attestation bug** — see STATUS.md for details. Triggers
-  even when the paste card successfully loaded the attestation; user wants
-  it noted but not fixed yet (they're focusing on other things first).
+- **Host-mode runs silently no-op when `/app/...` defaults aren't overridden.**
+  Running `ngate-sync.sh` directly on the host (not in the sidecar) requires
+  overriding `NGATE_YAML` AND every `paths.*` value in `ngate.yaml` to
+  host-absolute paths (e.g. `/opt/nostr-relay/...`). Two failure modes if
+  you don't:
+  (a) `ngate-apply` tries to write `/app/config.toml`, exits 1, and
+      `ngate-sync.sh` reports `apply exit=1 — check log` with no further
+      detail.
+  (b) The log path `/app/ngate-sync.log` is also unwritable, so the
+      `touch ... || LOG_FILE=/dev/null` fallback in `ngate-sync.sh` silently
+      routes ALL sub-script stderr into `/dev/null`. The visible output
+      collapses to four lines (start, cycle starting, cycle complete,
+      exiting) and the verbose verify/gate/apply lines vanish. Looks like
+      "the script does nothing." Use `bash -x ./scripts/ngate-sync.sh --once`
+      to bypass the swallow and see the real error path.
+  Also note: `ngate-sync.sh` defaults `paths.state_json` to `state.json`,
+  while `ngate-apply.sh` (when called manually outside sync) defaults to
+  `ngate-state.json`. If you mix manual and YAML runs, align both to the
+  same file or you'll get two diverging state views and confusing
+  "no changes" outcomes. Discovered the hard way 2026-05-15 on
+  nostr.v4call.com — 4 hours lost to silent stderr.
 
 ## What to NOT do
 
@@ -265,6 +282,17 @@ Adopted across all 5 nGate scripts:
 
 - **Stage 3.6** — small refinements: NIP-11 publication, hot YAML reload,
   HTTP health endpoint.
+- **Stage 3.7** — economic subscription / per-account-pair gate (see
+  STATUS.md for the full design block). **Part A BUILT 2026-05-15**:
+  independent conditions on escrow AND hive_account, env vars
+  `NGATE_ACCOUNT_MODE` + `NGATE_{ESCROW,HIVE}_MIN_*`, auto-triggered,
+  flat path unchanged, YAML nested `gate.escrow.*`/`gate.hive_account.*`.
+  Part B (NOT built, deferred): prorated fee /
+  burn-to-null gate with a mandatory payment-memo convention, recompute-from-
+  chain each cycle. HBD/HIVE reliable; custom-token *subscription* hits the
+  same unreliable Hive-Engine transferHistory API v4call abandoned (design
+  decision #5) — recommended token variant is a held-balance stake gate, not
+  a cumulative-paid fee. User wants this before Stage 4 strfry.
 - **Stage 4** — strfry migration. Live policy plugin replaces the
   config.toml-rewrite-and-restart loop.
 - **Stage 5** — user-tier nGate. Same architecture, scans v4call-rates

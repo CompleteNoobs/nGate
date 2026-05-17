@@ -69,6 +69,19 @@ MIN_TOKEN_AMOUNT=$(read_yaml '.gate.min_token_amount // 0')
 INCLUDE_STAKED_TOKEN=$(read_yaml '.gate.include_staked_token // true')
 GATE_MODE=$(read_yaml '.gate.mode // "or"')
 
+# ── Split-account mode (Stage 3.7 Part A) ───────────────────────────────────
+# Optional nested blocks gate.escrow.* and gate.hive_account.*. If either is
+# present, ngate-gate.sh runs in split-account mode (independent conditions on
+# the escrow account AND the hive_account, combined by gate.account_mode).
+# Absent → empty strings → flat single-account behaviour, unchanged.
+ACCOUNT_MODE=$(read_yaml '.gate.account_mode // "and"')
+ESCROW_MIN_HP=$(read_yaml          '.gate.escrow.min_hp // ""')
+ESCROW_MIN_TOKEN_SYMBOL=$(read_yaml '.gate.escrow.min_token_symbol // ""')
+ESCROW_MIN_TOKEN_AMOUNT=$(read_yaml '.gate.escrow.min_token_amount // ""')
+HIVE_MIN_HP=$(read_yaml             '.gate.hive_account.min_hp // ""')
+HIVE_MIN_TOKEN_SYMBOL=$(read_yaml   '.gate.hive_account.min_token_symbol // ""')
+HIVE_MIN_TOKEN_AMOUNT=$(read_yaml   '.gate.hive_account.min_token_amount // ""')
+
 MAX_CONSECUTIVE_FAILURES=$(read_yaml '.max_consecutive_failures // 3')
 MAX_RESTARTS_PER_DAY=$(read_yaml '.max_restarts_per_day // 6')
 VERBOSE=$(read_yaml '.verbose // false')
@@ -112,6 +125,13 @@ run_cycle() {
       NGATE_MIN_TOKEN_AMOUNT="$MIN_TOKEN_AMOUNT" \
       NGATE_INCLUDE_STAKED_TOKEN="$INCLUDE_STAKED_TOKEN" \
       NGATE_GATE_MODE="$GATE_MODE" \
+      NGATE_ACCOUNT_MODE="$ACCOUNT_MODE" \
+      NGATE_ESCROW_MIN_HP="$ESCROW_MIN_HP" \
+      NGATE_ESCROW_MIN_TOKEN_SYMBOL="$ESCROW_MIN_TOKEN_SYMBOL" \
+      NGATE_ESCROW_MIN_TOKEN_AMOUNT="$ESCROW_MIN_TOKEN_AMOUNT" \
+      NGATE_HIVE_MIN_HP="$HIVE_MIN_HP" \
+      NGATE_HIVE_MIN_TOKEN_SYMBOL="$HIVE_MIN_TOKEN_SYMBOL" \
+      NGATE_HIVE_MIN_TOKEN_AMOUNT="$HIVE_MIN_TOKEN_AMOUNT" \
       NGATE_DEBUG="$( [[ "$VERBOSE" == "true" ]] && echo 1 || echo 0 )" \
       "$SCRIPTS_DIR/ngate-gate.sh" 2>>"$LOG_FILE" > "$tmp_gated"
   local pipestatus=("${PIPESTATUS[@]}")

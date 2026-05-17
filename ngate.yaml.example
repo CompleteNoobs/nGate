@@ -49,6 +49,38 @@ gate:
   #   and — must pass both
   mode: or
 
+  # ── Split-account mode (Stage 3.7 Part A) ──────────────────────────
+  # OPTIONAL. Independent conditions on the escrow account AND the
+  # hive_account, evaluated separately then combined by account_mode.
+  # Triggered when either `escrow:` or `hive_account:` block below is
+  # present. When absent, the flat single-account config above
+  # (account/min_hp/min_token_*) is used unchanged.
+  #
+  # Within each account, its own hp/token sub-gates combine via the
+  # `mode:` field above (or/and). The two account RESULTS combine via
+  # account_mode here.
+  #
+  #   account_mode: and   # escrow-result AND hive-result (default)
+  #   account_mode: or    # escrow-result OR hive-result
+  #     ^ WARNING: with `or`, a side that has NO sub-gate passes
+  #       vacuously, so everything passes. Use `and`, or configure
+  #       both sides, when using `or`.
+  #
+  # Example: escrow must hold >=300 HP AND hive_account must hold
+  # >=4 CNOOBS:
+  #
+  # account_mode: and
+  # escrow:
+  #   min_hp: 300
+  #   min_token_symbol: ''
+  #   min_token_amount: 0
+  # hive_account:
+  #   min_hp: 0
+  #   min_token_symbol: CNOOBS
+  #   min_token_amount: 4
+  #
+  # (Leave the whole block commented out for flat single-account mode.)
+
 # ── Removal tolerance ────────────────────────────────────────────────
 # How many consecutive cycles a key must be MISSING before becoming
 # eligible for removal. With scan_interval=21600 and value=3, an
