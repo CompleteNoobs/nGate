@@ -170,6 +170,12 @@ AND-only or operator-configurable; token model (a) vs (b).
 
 ## Recent meaningful changes (last few sessions)
 
+- **2026-05-17**: README.md gained a full "Configuration reference — every
+  flag, what it does" section: pipeline-stage flag placement, complete env
+  var / YAML tables for scan + gate (flat Mode A + split Mode B) + apply,
+  the split-account command annotated line-by-line, everyday recipes, and
+  the "check the `config:` stderr line / redeploy if you see flat" tip.
+  Written for the operator who doesn't run this daily.
 - **2026-05-15**: Stage 3.7 **Part A shipped** — split-account gate. New
   `eval_account()` helper + split branch in `ngate-gate.sh`; env vars
   `NGATE_ACCOUNT_MODE` + `NGATE_{ESCROW,HIVE}_MIN_{HP,TOKEN_SYMBOL,TOKEN_AMOUNT}`.
