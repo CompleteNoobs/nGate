@@ -1,0 +1,708 @@
+{{:LICENCE_HEADER_MIT}}
+
+
+= strfry + nGate — A Hot-Reloading Whitelisted Nostr Relay on Ubuntu 24.04 =
+
+From CompleteNoobs
+
+This guide deploys a '''strfry''' Nostr relay at <code>nostr.v4call.com</code> on a fresh Ubuntu 24.04 server, behind TLS, with nGate driving a '''live, hot-reloading whitelist''' — the relay's allowed-publisher list is updated '''without ever restarting the relay'''.
+
+This is the "Stage 4" path described in [[CLAUDE.md]] / [[STATUS.md]]. It is an '''alternative''' to the [[#nostr-relay-with-whitelist|nostr-rs-relay]] stage-1 deploy, not a replacement you must take. Read the comparison below before deciding.
+
+This is a "noob doing Nostr by doing" walkthrough in the same style as the [[Nostr Relay With a 3-Key Whitelist]] guide. Every command can be copy-pasted exactly as shown. You do not need to know C++, Go, or Rust.
+
+== Why strfry instead of nostr-rs-relay? ==
+
+Both work. The difference is '''how the whitelist is updated'''.
+
+{| class="wikitable"
+! !! nostr-rs-relay (stage 1) !! strfry (this guide)
+|-
+| Whitelist lives in || <code>config.toml</code> <code>pubkey_whitelist = [...]</code> || a separate plain file the policy plugin reads
+|-
+| To change the whitelist || rewrite <code>config.toml</code> '''+ restart the container''' || rewrite the whitelist file — '''no restart'''
+|-
+| nGate apply phase || writes config.toml between BEGIN/END markers, runs <code>docker restart</code> || writes <code>whitelist.json</code> atomically; relay picks it up on the next event
+|-
+| Restart cap / sanity bound || needed (a restart loop would flap the relay) || restart cap becomes irrelevant — there is no restart
+|-
+| Downtime on whitelist change || ~1–3 s reconnect blip for every connected client || none — open connections stay up
+|-
+| Config format || TOML || strfry's own libconfig-style <code>strfry.conf</code> (NOT TOML)
+|}
+
+'''The headline:''' a strfry '''write-policy plugin''' is a small program strfry runs and pipes every incoming event to. The plugin decides accept/reject per event. Because the plugin re-reads the whitelist file on each event (cheap — it is tiny), the moment nGate rewrites that file the '''very next event''' is judged against the new list. No restart, no dropped client connections.
+
+'''The tradeoff (be honest):'''
+* The plugin runs '''once per inbound write event'''. It must be fast. Reading a small JSON file per event is fine; we add an mtime cache so it only re-parses when the file actually changes.
+* strfry's config file is '''not''' TOML. If you already run nostr-rs-relay you cannot reuse <code>config.toml</code> — this is a parallel setup.
+* nGate's <code>scan → verify → gate</code> phases are '''unchanged'''. Only the <code>apply</code> phase swaps backend (writes a whitelist file instead of config.toml + restart). This guide ships a small <code>ngate-strfry-apply.sh</code> for that; the 3-strike-miss / state machinery from <code>ngate-apply.sh</code> is a later port (see [[#Whats_deferred|What's deferred]]).
+
+'''Answering the question "can strfry be a Docker image?"''' — '''Yes.''' strfry ships an official multi-stage <code>Dockerfile</code> in its source repo. You <code>docker build</code> it once on the box (Step 7) and run it from <code>docker compose</code> like any other service. There are also community-published images on registries; we build from source instead so you are running code you fetched from the official repo at a tag you chose (trust tradeoff — a prebuilt image is faster but you are trusting whoever pushed it).
+
+== Contents ==
+
+* [[#What_You_Need|1 What You Need]]
+* [[#Step_1:_Create_and_Point_the_Server|2 Step 1: Create and Point the Server]]
+* [[#Step_2:_Log_In_and_Harden|3 Step 2: Log In and Harden]]
+* [[#Step_3:_Install_Docker|4 Step 3: Install Docker]]
+* [[#Step_4:_Open_the_Firewall|5 Step 4: Open the Firewall]]
+* [[#Step_5:_Project_Folder_Layout|6 Step 5: Project Folder Layout]]
+* [[#Step_6:_Get_Your_Whitelisted_Keys_in_Hex|7 Step 6: Get Your Whitelisted Keys in Hex]]
+* [[#Step_7:_Build_the_strfry_Docker_Image|8 Step 7: Build the strfry Docker Image]]
+* [[#Step_8:_Write_strfry.conf|9 Step 8: Write strfry.conf]]
+* [[#Step_9:_The_Write-Policy_Plugin|10 Step 9: The Write-Policy Plugin]]
+* [[#Step_10:_Seed_the_Whitelist|11 Step 10: Seed the Whitelist]]
+* [[#Step_11:_Caddy_for_TLS|12 Step 11: Caddy for TLS]]
+* [[#Step_12:_docker-compose.yml|13 Step 12: docker-compose.yml]]
+* [[#Step_13:_Start_It_Up|14 Step 13: Start It Up]]
+* [[#Step_14:_Prove_the_Whitelist_Works|15 Step 14: Prove the Whitelist Works]]
+* [[#Step_15:_Prove_Hot-Reload_Works|16 Step 15: Prove Hot-Reload Works (the whole point)]]
+* [[#Step_16:_Wire_in_nGate|17 Step 16: Wire in nGate]]
+* [[#Step_17:_Automate_It_with_cron|18 Step 17: Automate It with cron]]
+* [[#Common_Problems_and_Fixes|19 Common Problems and Fixes]]
+* [[#Whats_deferred|20 What's deferred]]
+* [[#Tips_for_Noobs|21 Tips for Noobs]]
+
+== What You Need ==
+
+* '''A VPS''' running fresh '''Ubuntu 24.04''', 1 GB RAM minimum (2 GB comfortable — the strfry build is C++ and wants RAM to compile). Vultr, Hetzner, DigitalOcean, etc. If using Vultr, our [https://www.vultr.com/?ref=7704739 Vultr referral link] helps cover server costs.
+* '''A domain/subdomain''' with DNS access — this guide uses <code>nostr.v4call.com</code>. Substitute your own everywhere you see it.
+* '''Your whitelisted Nostr keys in hex''' (Step 6 shows conversion). At minimum: the operator's own key, so you don't lock yourself out.
+* '''A terminal + SSH''' and about '''45–60 minutes''' (the strfry compile is the slow part — 5–15 min depending on the box).
+* '''The nGate repo''' if you want the automated whitelist (Step 16). Without nGate this is still a perfectly good manually-managed hot-reload relay.
+
+== Step 1: Create and Point the Server ==
+
+# Create the Ubuntu 24.04 VPS in your provider's panel. Note its public IPv4 address.
+# In your DNS provider, add an '''A record''': <code>nostr.v4call.com → &lt;your VPS IP&gt;</code>. TTL 300 is fine.
+# Wait for DNS to propagate. Check from your laptop:
+
+ dig +short nostr.v4call.com
+
+When that prints your VPS IP, continue. (Caddy in Step 11 will not be able to get a TLS certificate until DNS resolves correctly, so don't skip this.)
+
+== Step 2: Log In and Harden ==
+
+ ssh root@nostr.v4call.com
+
+Basic hardening (same as the stage-1 guide — skip if you already have your own baseline):
+
+ apt update && apt upgrade -y
+ adduser noob
+ usermod -aG sudo noob
+ rsync --archive --chown=noob:noob ~/.ssh /home/noob
+ # then log out and back in as: ssh noob@nostr.v4call.com
+
+From here on, run commands as the <code>noob</code> user with <code>sudo</code> where shown.
+
+== Step 3: Install Docker ==
+
+ sudo apt update
+ sudo apt install -y ca-certificates curl git
+ sudo install -m 0755 -d /etc/apt/keyrings
+ sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+ sudo chmod a+r /etc/apt/keyrings/docker.asc
+ echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+ sudo apt update
+ sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+ sudo usermod -aG docker $USER
+ newgrp docker
+
+Verify:
+
+ docker --version
+ docker compose version
+
+== Step 4: Open the Firewall ==
+
+ sudo ufw allow OpenSSH
+ sudo ufw allow 80/tcp
+ sudo ufw allow 443/tcp
+ sudo ufw --force enable
+ sudo ufw status
+
+Only 22 (SSH), 80 and 443 are exposed. strfry's own port (7777) stays internal to the Docker network — Caddy is the only thing the public talks to.
+
+== Step 5: Project Folder Layout ==
+
+ sudo mkdir -p /opt/nostr-relay
+ sudo chown -R $USER:$USER /opt/nostr-relay
+ cd /opt/nostr-relay
+ mkdir -p strfry-db policy caddy_data caddy_config
+
+You will end up with:
+
+ /opt/nostr-relay/
+ ├── docker-compose.yml          (Step 12)
+ ├── strfry.conf                 (Step 8)
+ ├── Caddyfile                   (Step 11)
+ ├── strfry/                     (the cloned strfry source, for the image build — Step 7)
+ ├── policy/
+ │   ├── whitelist-policy.sh     (the write-policy plugin — Step 9)
+ │   └── whitelist.json          (the live whitelist nGate rewrites — Step 10)
+ ├── seed.toml                   (operator's always-allowed keys — Step 10)
+ ├── strfry-db/                  (LMDB event database — created by strfry)
+ ├── caddy_data/  caddy_config/  (Caddy TLS state)
+ └── (nGate bits added in Step 16)
+
+== Step 6: Get Your Whitelisted Keys in Hex ==
+
+Nostr relays compare the '''hex''' form of a public key, not the bech32 <code>npub1...</code> form. Same key, different encoding. The whitelist file holds hex.
+
+To convert an npub to hex, the easiest no-install option: open <code>public/nostr-gen.html</code> from the v4call repo in any browser — it has an npub↔hex converter and never sends anything over the network. Or with the <code>nak</code> CLI:
+
+ nak decode npub1yourkeyhere
+
+Write down each whitelisted key's 64-character hex string. You need at least the '''operator's own key''' before first start, or you lock yourself out (same rule as nGate's <code>seed.toml</code> — see [[CLAUDE.md]] decision #6).
+
+== Step 7: Build the strfry Docker Image ==
+
+We build from the official source at a pinned tag so you know exactly what you are running.
+
+<div class="toccolours mw-collapsible mw-collapsed">
+'''Useful info for low-powered VPS builds — read this BEFORE you run <code>docker build</code>'''
+<div class="mw-collapsible-content">
+
+The strfry compile is C++ (<code>g++ -std=c++20 -O3</code>) and it is the single most resource-hungry thing in this whole guide. On a small VPS it can make the box go '''completely unresponsive''' — you can't even open a second SSH session. Here is what is actually happening and how to survive it.
+
+'''It's RAM, not "CPU at 100%".''' Linux schedules CPU fairly, so a pegged CPU still lets <code>sshd</code> in (just slowly). What truly freezes a tiny box is '''memory exhaustion''': each <code>g++</code> process on strfry can need '''1–1.5 GB''', and strfry's Dockerfile compiles several files in parallel. On a 1 GB VPS with no swap you hit the OOM killer / heavy swapping, and that is what blocks new logins. '''The build looks frozen but usually isn't''' — a single <code>main.cpp</code> object can take minutes with no output. Don't <code>Ctrl-C</code> too early (the way you almost did).
+
+'''There is no "limit build to 70% CPU" flag.''' This guide's build uses BuildKit (you'll see <code>[+] Building</code> with <code>docker:default</code>). BuildKit '''ignores''' <code>--cpu-quota</code> / <code>--cpus</code> / <code>--cpuset-cpus</code> during <code>docker build</code> — those flags only apply to <code>docker run</code> (runtime containers), not to the build. <code>nice docker build ...</code> also does nothing useful, because the compiler processes are children of <code>dockerd</code>/<code>containerd</code>, not of your <code>docker</code> CLI, so the renice doesn't propagate. The real levers are '''parallelism''' and '''swap''', not a CPU percentage.
+
+'''Lever 1 — lower the compile parallelism (biggest win).''' strfry's <code>Dockerfile</code> contains a line like:
+
+ RUN --mount=type=cache,target=/build/.cache \
+     make -j4
+
+<code>-j4</code> = up to 4 compilers at once = up to ~4–6 GB peak RAM. Edit it down before building:
+* <code>make -j1</code> — serial. Slowest, but a 1 GB box survives it. Safest on the smallest VPS.
+* <code>make -j2</code> — a sane middle ground if you have ≥2 GB RAM.
+
+This one edit is what turns "box OOM-kills the compiler / freezes" into "slow but it finishes".
+
+'''Lever 2 — add swap BEFORE you build.''' Even 2 GB of swap turns "unresponsive / OOM" into "sluggish but still loggable, and the build completes". The swap commands are right after this box — run them '''first'''.
+
+ sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+
+'''Lever 3 — never lose your session.''' Start the build inside <code>tmux</code> (or <code>screen</code>) so a dropped connection or a lock-up doesn't kill the build or lock you out:
+
+ tmux new -s build      # then run the build inside it
+ # Ctrl-b then d  to detach;  tmux attach -t build  to come back
+
+Also open your '''second SSH session before''' starting the build, not after — once the box is under memory pressure you may not be able to log in fresh.
+
+'''Watch the right thing.''' In the second session run <code>htop</code> (<code>sudo apt install -y htop</code>) and watch the '''Mem / Swp''' bars and swap in/out, not just CPU%. Swap churning = it's RAM = the fix is lower <code>-jN</code> + more swap, exactly as above.
+
+'''TL;DR for a small box:''' add swap → edit <code>make -j4</code> down to <code>-j1</code> (or <code>-j2</code> if ≥2 GB) → run the build inside <code>tmux</code> → watch <code>htop</code>'s memory line → be patient, a quiet build is normal.
+</div>
+</div>
+
+ cd /opt/nostr-relay
+ git clone https://github.com/hoytech/strfry.git strfry
+ cd strfry
+ git submodule update --init
+ # Pin to a release tag (check https://github.com/hoytech/strfry/releases for the latest)
+ git checkout 1.0.4
+ docker build -t strfry:1.0.4 .
+ cd /opt/nostr-relay
+
+This compiles strfry inside Docker. It is the slow step — '''5–15 minutes''' and a chunk of RAM. If the build is killed (OOM) on a 1 GB box, add swap first:
+
+ sudo fallocate -l 2G /swapfile
+ sudo chmod 600 /swapfile
+ sudo mkswap /swapfile
+ sudo swapon /swapfile
+
+then re-run <code>docker build</code>.
+
+'''Now build the nGate-flavoured image (REQUIRED — do not skip).''' The official strfry image is built <code>FROM alpine</code>, which ships busybox <code>sh</code> only — '''no <code>bash</code>, no <code>jq</code>'''. The write-policy plugin in Step 9 needs both. If you run the stock <code>strfry:1.0.4</code> image, the relay starts and serves reads fine, but '''every publish fails with <code>error: internal error</code>''' because the plugin can't execute (you'd waste an hour finding that out — we did). Bake the two tools in with a three-line wrapper image. Create <code>/opt/nostr-relay/Dockerfile.relay</code>:
+
+<pre>
+FROM strfry:1.0.4
+RUN apk add --no-cache bash jq
+</pre>
+
+Build it:
+
+ cd /opt/nostr-relay
+ docker build -t strfry-ngate:1.0.4 -f Dockerfile.relay .
+
+'''From here on the relay image you run is <code>strfry-ngate:1.0.4</code>''' (the compose file in Step 12 uses it). The plain <code>strfry:1.0.4</code> image only exists as the base for this wrapper. (<code>busybox stat -c %Y</code> — which the plugin also uses — '''is''' supported by Alpine's busybox, so once <code>bash</code> + <code>jq</code> are present the Step 9 plugin runs unmodified.)
+
+'''Shortcut (optional, trust tradeoff):''' community-prebuilt images exist on container registries. Using one skips the compile but means trusting whoever pushed it. For a relay that gates who can write, building from the official repo yourself is the safer default. If you do use a prebuilt image, pin it by digest, not <code>:latest</code>.
+
+== Step 8: Write strfry.conf ==
+
+strfry's config is '''not TOML''' — it is a libconfig-style format. Create <code>/opt/nostr-relay/strfry.conf</code>:
+
+<pre>
+# strfry.conf — nostr.v4call.com
+db = "/app/strfry-db/"
+
+dbParams {
+    maxreaders = 256
+    mapsize = 10995116277760
+}
+
+relay {
+    bind = "0.0.0.0"
+    port = 7777
+
+    # strfry tries to raise its open-file limit to 1,000,000 by default.
+    # Most VPS hosts cap well below that, so strfry aborts on startup
+    # ("Unable to set NOFILES limit ...") and crash-loops. 0 = "don't
+    # attempt to set the limit, inherit the container's" — host-independent
+    # and the right default here. THIS KEY MUST BE INSIDE relay { } —
+    # at the top level strfry silently ignores it (see Common Problems).
+    nofiles = 0
+
+    # We are behind Caddy; Caddy sets X-Forwarded-For. realIpHeader lets
+    # strfry log the true client IP instead of the docker network IP.
+    realIpHeader = "x-forwarded-for"
+
+    info {
+        name = "nostr.v4call.com"
+        description = "Whitelisted relay — write-gated by nGate, public read."
+        pubkey = ""
+        contact = ""
+    }
+
+    maxWebsocketPayloadSize = 131072
+    autoPingSeconds = 55
+
+    # ── The bit that matters ──────────────────────────────────────────
+    # writePolicy.plugin points at an executable strfry pipes every
+    # inbound EVENT to (one JSON object per line on stdin; the plugin
+    # replies with one JSON object per line on stdout). The plugin reads
+    # the live whitelist file on each event, so rewriting that file
+    # changes the policy WITHOUT restarting strfry.
+    writePolicy {
+        plugin = "/app/policy/whitelist-policy.sh"
+    }
+}
+</pre>
+
+Notes:
+* <code>db</code>, plugin path etc. are '''container-internal''' paths (<code>/app/...</code>). The compose file in Step 12 bind-mounts host folders onto them.
+* Changing <code>strfry.conf</code> itself (e.g. the plugin '''path''') '''does''' need a strfry restart — but the whitelist '''data''' the plugin reads does not. That distinction is the whole point: config path = static, whitelist data = live.
+
+== Step 9: The Write-Policy Plugin ==
+
+Create <code>/opt/nostr-relay/policy/whitelist-policy.sh</code>. This is the program strfry runs. It reads one JSON line per event on stdin and must print one JSON line per event on stdout: <code>{"id":"&lt;event id&gt;","action":"accept"|"reject","msg":"..."}</code>.
+
+It reads <code>whitelist.json</code> (a JSON array of hex pubkeys) fresh — but only re-parses when the file's mtime changes, so the hot path is a cheap stat, not a re-read, per event.
+
+'''Prerequisite:''' this script needs <code>bash</code> and <code>jq</code> '''inside the relay container'''. Stock strfry (Alpine) has neither — that is exactly why Step 7 builds the <code>strfry-ngate:1.0.4</code> wrapper image. If publishes fail with <code>error: internal error</code>, you skipped that. Two filenames that are easy to confuse: <code>whitelist-policy.sh</code> is '''this script''' (the program strfry runs); <code>whitelist.json</code> is the '''data file''' it reads (Step 10, rewritten by nGate). There is no <code>whitelist-policy.json</code> — if you find one it's a stray, ignore/delete it.
+
+<pre>
+#!/usr/bin/env bash
+# strfry write-policy plugin — whitelist gate with mtime-cached reload.
+# Protocol: https://github.com/hoytech/strfry/blob/master/docs/plugins.md
+# stdin : one JSON per line  {"type":"new","event":{"id":..,"pubkey":..},...}
+# stdout: one JSON per line  {"id":"<event id>","action":"accept"|"reject","msg":".."}
+set -eo pipefail
+
+WL="${STRFRY_WHITELIST:-/app/policy/whitelist.json}"
+
+cached_mtime=""
+declare -A allow      # hex pubkey -> 1
+
+reload_if_changed() {
+  local m
+  m=$(stat -c %Y "$WL" 2>/dev/null || echo "")
+  [[ "$m" == "$cached_mtime" ]] && return 0
+  cached_mtime="$m"
+  allow=()
+  if [[ -s "$WL" ]]; then
+    while IFS= read -r hex; do
+      [[ -n "$hex" ]] && allow["${hex,,}"]=1
+    done < <(jq -r '.[]? // empty' "$WL" 2>/dev/null || true)
+  fi
+  # Stderr is strfry's plugin log — handy for "did the reload fire?"
+  echo "[whitelist-policy] reloaded: ${#allow[@]} key(s) from $WL" >&2
+}
+
+# Prime once so the first event isn't slowed by a cold load.
+reload_if_changed
+
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  reload_if_changed
+
+  id=$(echo "$line"     | jq -r '.event.id     // empty')
+  pubkey=$(echo "$line" | jq -r '.event.pubkey // empty')
+  pubkey="${pubkey,,}"
+
+  if [[ -n "$pubkey" && -n "${allow[$pubkey]:-}" ]]; then
+    printf '{"id":"%s","action":"accept"}\n' "$id"
+  else
+    printf '{"id":"%s","action":"reject","msg":"blocked: not on relay whitelist"}\n' "$id"
+  fi
+done
+</pre>
+
+Make it executable:
+
+ chmod +x /opt/nostr-relay/policy/whitelist-policy.sh
+
+'''Why bash + jq?''' Zero extra runtime, and <code>jq</code> is already an nGate dependency so the mental model stays consistent across the project. For a very high-throughput public relay you would rewrite this in Go/Rust; for an nGated federation-discovery relay the event rate is low and bash is plenty. (If you find the per-event <code>jq</code> spawn too heavy at scale, that's the upgrade trigger — note it and move on; don't pre-optimise.)
+
+== Step 10: Seed the Whitelist ==
+
+Two files:
+
+'''<code>seed.toml</code>''' — operator-managed, never auto-removed (same concept and filename as nGate stage 1, [[CLAUDE.md]] decision #6). One hex pubkey per line, <code>#</code> for comments:
+
+ # /opt/nostr-relay/seed.toml — operator's always-allowed keys
+ # Put YOUR key here before first start or you lock yourself out.
+ abc123...your64charhexkey...def
+
+'''<code>policy/whitelist.json</code>''' — the live file the plugin reads. nGate rewrites this in Step 16. Until then, hand-seed it from your seed keys. A JSON array of hex strings:
+
+<pre>
+[
+  "abc123...your64charhexkey...def"
+]
+</pre>
+
+For now they overlap by hand. Once nGate is wired (Step 16) it produces <code>whitelist.json</code> as <code>(seed.toml ∪ verified+gated discovered keys)</code> — the seed is always merged in so the operator can never be auto-evicted.
+
+== Step 11: Caddy for TLS ==
+
+Create <code>/opt/nostr-relay/Caddyfile</code>:
+
+<pre>
+nostr.v4call.com {
+    reverse_proxy nostr-relay:7777
+}
+</pre>
+
+Caddy auto-obtains and auto-renews a Let's Encrypt certificate for the domain and reverse-proxies WebSocket traffic to strfry. (This is identical in spirit to the stage-1 nostr-rs-relay Caddyfile — only the upstream port differs: strfry uses 7777, nostr-rs-relay used 8080.)
+
+== Step 12: docker-compose.yml ==
+
+Create <code>/opt/nostr-relay/docker-compose.yml</code>:
+
+<pre>
+services:
+
+  nostr-relay:
+    image: strfry-ngate:1.0.4          # bash+jq wrapper from Step 7, NOT plain strfry:1.0.4
+    container_name: nostr-relay
+    restart: unless-stopped
+    command: relay
+    volumes:
+      - ./strfry.conf:/etc/strfry.conf:ro
+      - ./strfry-db:/app/strfry-db
+      - ./policy:/app/policy            # plugin + whitelist.json (RW: nGate writes here)
+    expose:
+      - "7777"
+    networks:
+      - relaynet
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy_data:/data
+      - ./caddy_config:/config
+    depends_on:
+      - nostr-relay
+    networks:
+      - relaynet
+
+networks:
+  relaynet:
+    driver: bridge
+</pre>
+
+Notes:
+* strfry's default Dockerfile reads <code>/etc/strfry.conf</code> and the entrypoint takes a subcommand (<code>relay</code> to run the relay). If your pinned strfry tag uses a different default config path, check <code>docker run --rm strfry:1.0.4 --help</code> and adjust the bind-mount target — this is the #1 version-drift gotcha.
+* The <code>./policy</code> mount is '''read-write''' (no <code>:ro</code>) because nGate rewrites <code>whitelist.json</code> inside it. The plugin script itself is operator-trusted code.
+* No Docker socket is mounted and there is '''no restart command''' anywhere — that whole class of nGate machinery (restart cap, sanity bound, BEGIN/END markers) is simply not needed here.
+
+== Step 13: Start It Up ==
+
+ cd /opt/nostr-relay
+ docker compose up -d
+ docker compose ps
+ docker compose logs -f caddy        # watch the cert get issued (Ctrl-C to stop tailing)
+ docker compose logs -f nostr-relay  # watch strfry start + the plugin's reload line
+
+You should see, in the relay log, the plugin's <code>[whitelist-policy] reloaded: N key(s)</code> line on the first event (or at prime time). If Caddy logs a certificate error, re-check DNS (Step 1) — it cannot issue a cert until <code>nostr.v4call.com</code> resolves to this box.
+
+== Step 14: Prove the Whitelist Works ==
+
+Install the <code>nak</code> CLI on your laptop (or any machine):
+
+ go install github.com/fiatjaf/nak@latest
+
+'''Accepted''' — publish with a key that IS in <code>whitelist.json</code>:
+
+ nak event -k 1 -c "hello from a whitelisted key" --sec <nsec-of-a-whitelisted-key> wss://nostr.v4call.com
+
+You should get an OK / accepted response.
+
+'''Rejected''' — publish with a fresh random key that is NOT whitelisted:
+
+ nak event -k 1 -c "i should be blocked" --sec $(nak key generate) wss://nostr.v4call.com
+
+You should get a rejection carrying <code>blocked: not on relay whitelist</code> (the <code>msg</code> from the plugin).
+
+'''Public read still works for everyone''' (whitelist gates writes only):
+
+ nak req -k 1 wss://nostr.v4call.com
+
+== Step 15: Prove Hot-Reload Works (the whole point) ==
+
+This is the demo that justifies the whole strfry switch.
+
+# Pick a fresh key and confirm it is '''rejected''' (it's not whitelisted yet):
+#: <code>NSEC=$(nak key generate); echo "$NSEC"</code>
+#: <code>nak event -k 1 -c "before" --sec "$NSEC" wss://nostr.v4call.com</code> → rejected.
+# Get that key's hex: <code>nak decode &lt;the npub nak printed&gt;</code> (or it prints hex with <code>nak key public</code> flows).
+# On the server, add the hex to the whitelist file '''with no restart''':
+#: <code>cd /opt/nostr-relay/policy</code>
+#: <code>jq '. + ["&lt;newhex&gt;"]' whitelist.json &gt; whitelist.json.tmp && mv whitelist.json.tmp whitelist.json</code>
+#: (the atomic <code>tmp</code> + <code>mv</code> is deliberate — never write the live file in place)
+# Immediately re-publish with the same key:
+#: <code>nak event -k 1 -c "after" --sec "$NSEC" wss://nostr.v4call.com</code> → '''now accepted'''.
+
+No <code>docker restart</code>, no reconnect blip, open client connections never dropped. That is the entire reason this guide exists. The relay log shows a fresh <code>[whitelist-policy] reloaded: N key(s)</code> line the moment the file's mtime changed.
+
+== Step 16: Wire in nGate ==
+
+nGate's first three phases — <code>ngate-scan.sh</code> → <code>ngate-verify.sh</code> → <code>ngate-gate.sh</code> — are '''unchanged''' from the stage-3 walkthrough ([[nGate-auto-whitelist]]). They read Hive <code>v4call-server</code> posts, verify the Hive signature + Nostr attestation, apply the HP/token economic gate, and emit verified+gated NDJSON. Only the final '''apply''' phase differs: instead of rewriting <code>config.toml</code> and restarting (<code>ngate-apply.sh</code>), we atomically write <code>whitelist.json</code> and stop there.
+
+'''Get nGate onto the box.''' Clone the repo into the project folder and install its Node crypto-helper dependencies (dhive + nostr-tools — the phase scripts shell out to them for Hive ECDSA / Nostr schnorr verification):
+
+ cd /opt/nostr-relay
+ git clone https://github.com/completenoobs/ngate.git nGate
+ sudo apt install -y npm
+ cd /opt/nostr-relay/nGate/scripts
+ npm install
+
+(<code>npm install</code> reads <code>scripts/package.json</code> and populates <code>scripts/node_modules/</code>. Skip it and <code>ngate-verify.sh</code> dies the first time it verifies a signature — "cannot find module '@hiveio/dhive'".)
+
+The strfry apply backend <code>ngate-strfry-apply.sh</code> '''ships in <code>nGate/scripts/</code>''' alongside the other phase scripts — you do '''not''' need to hand-create it. It is reproduced here for reference so you can see exactly what it does (seed-merge, atomic write, no restart):
+
+<pre>
+#!/usr/bin/env bash
+# ngate-strfry-apply.sh — Stage-4 apply backend for strfry.
+# Reads verified+gated NDJSON on stdin (same format ngate-apply.sh consumes),
+# merges in seed.toml, atomically rewrites whitelist.json. NO restart needed —
+# strfry's write-policy plugin re-reads the file live.
+#
+#   ... | ngate-gate.sh | ./ngate-strfry-apply.sh --apply
+#
+# Defaults to --dry-run (nGate convention: write-side scripts need explicit --apply).
+set -eo pipefail
+
+DRY_RUN=true
+[[ "${1:-}" == "--apply" ]] && DRY_RUN=false
+
+WL="${NGATE_WHITELIST_PATH:-/opt/nostr-relay/policy/whitelist.json}"
+SEED="${NGATE_SEED_PATH:-/opt/nostr-relay/seed.toml}"
+
+declare -A keep
+
+# 1. seed.toml — always merged, never auto-removed (CLAUDE.md decision #6)
+if [[ -f "$SEED" ]]; then
+  while IFS= read -r raw; do
+    line="${raw%%#*}"; line="$(echo "$line" | tr -d '[:space:]')"
+    [[ -n "$line" ]] && keep["${line,,}"]=1
+  done < "$SEED"
+fi
+
+# 2. verified+gated discovered keys from stdin NDJSON
+while IFS= read -r ev; do
+  [[ -z "$ev" ]] && continue
+  hex=$(echo "$ev" | jq -r '.nostr_pubkey_hex // empty' 2>/dev/null || true)
+  [[ -n "$hex" ]] && keep["${hex,,}"]=1
+done
+
+# 3. render sorted JSON array
+new_json=$(printf '%s\n' "${!keep[@]}" | sort | jq -R . | jq -s .)
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  echo "DRY RUN — would write $(echo "$new_json" | jq 'length') key(s) to $WL" >&2
+  echo "$new_json"
+  exit 0
+fi
+
+# atomic write — strfry's plugin re-reads on mtime change, no restart
+tmp="$(mktemp)"
+echo "$new_json" > "$tmp"
+mv "$tmp" "$WL"
+echo "✓ wrote $(echo "$new_json" | jq 'length') key(s) to $WL (no restart)" >&2
+</pre>
+
+"The scripts are already executable from the clone. '''Run the chain manually first''' — nGate's safe default is dry-run, so this changes nothing yet:
+
+ cd /opt/nostr-relay/nGate/scripts
+ ./ngate-scan.sh \
+   | ./ngate-verify.sh \
+   | NGATE_GATE_ACCOUNT=hive_account NGATE_MIN_TOKEN_SYMBOL=CNOOBS NGATE_MIN_TOKEN_AMOUNT=3 ./ngate-gate.sh \
+   | ./ngate-strfry-apply.sh
+
+Read the output. <code>ngate-verify</code> prints one line per discovered server (<code>OK</code> / <code>REJECT</code> / <code>skip</code>); <code>ngate-gate</code> prints who passed the economic gate; the apply line says <code>DRY RUN — would write N key(s)</code>. The <code>REJECT … no nostr_attestation</code> and <code>skip … no nostr_pubkey_hex</code> lines for old / pre-Nostr announces are '''expected''' and correct ([[CLAUDE.md]] decision #1 — attestation required, no legacy compat), not errors.
+
+'''When the dry-run looks right, apply for real''' (this is the exact command verified on <code>nostr.hive-book.com</code> — substitute your own gate thresholds):
+
+ cd /opt/nostr-relay/nGate/scripts
+ ./ngate-scan.sh \
+   | ./ngate-verify.sh \
+   | NGATE_GATE_ACCOUNT=hive_account NGATE_MIN_TOKEN_SYMBOL=CNOOBS NGATE_MIN_TOKEN_AMOUNT=3 ./ngate-gate.sh \
+   | NGATE_MAX_CONSECUTIVE_MISSES=1 ./ngate-strfry-apply.sh --apply
+
+Success looks like <code>✓ wrote N key(s) to /opt/nostr-relay/policy/whitelist.json (no restart)</code>. Confirm:
+
+ cat /opt/nostr-relay/policy/whitelist.json
+
+It should hold your seed key (from <code>seed.toml</code>, always merged even though it is not on Hive — that is the point of the seed) '''plus''' one hex per verified+gated server. The relay picks it up on the very next event — '''no restart''' — and logs <code>[whitelist-policy] reloaded: N key(s)</code>.
+
+''(Note the two flags shown: <code>--apply</code> turns off dry-run; add <code>--allow-removals</code> only when you want keys that have dropped off Hive to be pruned. Without <code>--allow-removals</code> the apply is ADD-only — safe against a transient Hive outage nuking your whitelist. <code>NGATE_MAX_CONSECUTIVE_MISSES</code> is carried for forward-compat with the deferred miss-counter — see [[#Whats_deferred|What's deferred]].)''
+
+== Step 17: Automate It with cron ==
+
+Manual runs prove it works; cron keeps it current. Every run recomputes the whitelist from Hive and atomically rewrites <code>whitelist.json</code> — '''no relay restart, ever''' — so running it often is cheap and safe.
+
+'''Recommended: the explicit-env one-liner (this is the tested path).''' Edit your crontab:
+
+ crontab -e
+
+Add (runs every 30 minutes; adjust the schedule — see the cheatsheet below):
+
+<pre>
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+*/30 * * * * cd /opt/nostr-relay/nGate/scripts && flock -n /tmp/ngate.lock ./ngate-scan.sh | ./ngate-verify.sh | NGATE_GATE_ACCOUNT=hive_account NGATE_MIN_TOKEN_SYMBOL=CNOOBS NGATE_MIN_TOKEN_AMOUNT=3 ./ngate-gate.sh | NGATE_MAX_CONSECUTIVE_MISSES=1 ./ngate-strfry-apply.sh --apply --allow-removals >> /opt/nostr-relay/ngate-cron.log 2>&1
+</pre>
+
+'''Schedule cheatsheet''' (the five fields are <code>minute hour day-of-month month day-of-week</code>):
+
+{| class="wikitable"
+! Cron expression !! Runs
+|-
+| <code>*/15 * * * *</code> || every 15 minutes
+|-
+| <code>*/30 * * * *</code> || every 30 minutes
+|-
+| <code>0 * * * *</code> || every hour, on the hour
+|-
+| <code>0 */6 * * *</code> || every 6 hours
+|-
+| <code>0 3 * * *</code> || once a day at 03:00
+|}
+
+'''Three cron gotchas that bite everyone''' (noob-tested, in this guide's spirit):
+* '''cron has almost no <code>PATH</code>.''' It does '''not''' inherit your login shell's environment, so <code>node</code>, <code>jq</code>, <code>git</code>, <code>flock</code> may not be found and the run silently does nothing. The <code>PATH=</code> line at the top of the crontab fixes this; if <code>node</code> lives somewhere odd (<code>which node</code> to check), add its directory to that <code>PATH=</code>.
+* '''Always redirect to a log''' (<code>>> ... 2>&1</code>). Without it cron emails output into a local mailbox you'll never read, and a broken run is invisible. <code>tail -f /opt/nostr-relay/ngate-cron.log</code> after the first scheduled fire to confirm it ran clean.
+* '''<code>flock -n</code> prevents overlap.''' A slow Hive scan that runs past the next tick would otherwise start a second copy on top of the first. <code>flock -n /tmp/ngate.lock</code> makes the new run bail if one is already going. (<code>flock</code> is from <code>util-linux</code>, present on Ubuntu by default.)
+
+'''Alternative: drive the gate config from <code>ngate.yaml</code> instead of inline env vars.''' nGate ships <code>ngate.yaml.example</code> and a loop wrapper <code>ngate-sync.sh</code> that reads the YAML and translates it into the same <code>NGATE_*</code> env vars. '''Caveat — be honest about this:''' the stock <code>ngate-sync.sh</code> is hardwired to the stage-1 <code>ngate-apply.sh</code> (config.toml + restart), '''not''' the strfry backend. Until a strfry-aware sync wrapper lands (tracked under [[#Whats_deferred|What's deferred]]), the clean way to get YAML-driven config on a strfry box is a tiny shim that reads the gate keys out of <code>ngate.yaml</code> with <code>yq</code> and feeds the strfry pipeline:
+
+<pre>
+#!/usr/bin/env bash
+# /opt/nostr-relay/nGate/scripts/ngate-strfry-cron.sh
+# YAML-driven one-shot for the strfry backend. Point cron at THIS instead of
+# the long inline pipeline if you'd rather keep gate config in ngate.yaml.
+set -eo pipefail
+cd "$(dirname "$0")"
+Y="${NGATE_YAML:-/opt/nostr-relay/ngate.yaml}"
+
+GA=$(yq -r '.gate.account            // "hive_account"' "$Y")
+TS=$(yq -r '.gate.min_token_symbol   // ""'             "$Y")
+TA=$(yq -r '.gate.min_token_amount   // 0'              "$Y")
+MM=$(yq -r '.max_consecutive_failures // 1'             "$Y")
+
+./ngate-scan.sh \
+  | ./ngate-verify.sh \
+  | NGATE_GATE_ACCOUNT="$GA" NGATE_MIN_TOKEN_SYMBOL="$TS" NGATE_MIN_TOKEN_AMOUNT="$TA" ./ngate-gate.sh \
+  | NGATE_MAX_CONSECUTIVE_MISSES="$MM" ./ngate-strfry-apply.sh --apply --allow-removals
+</pre>
+
+ chmod +x /opt/nostr-relay/nGate/scripts/ngate-strfry-cron.sh
+
+Then the crontab line collapses to:
+
+<pre>
+*/30 * * * * flock -n /tmp/ngate.lock /opt/nostr-relay/nGate/scripts/ngate-strfry-cron.sh >> /opt/nostr-relay/ngate-cron.log 2>&1
+</pre>
+
+This shim is '''not''' tested end-to-end the way the explicit-env pipeline above is — review it and dry-run it once (drop <code>--apply</code>) before trusting it on a schedule. The explicit-env crontab line is the path this guide has actually run in production; the YAML shim is offered as the tidier option once you've verified it on your box. (<code>yq</code> here is mikefarah's Go <code>yq</code> or kislyuk's Python <code>yq</code> — both handle these <code>.field // default</code> queries; <code>sudo apt install -y yq</code> or grab the mikefarah release binary.)
+
+'''Alternative: a compose sidecar instead of cron.''' If you'd rather not use cron, add an nGate sidecar service to <code>docker-compose.yml</code> the same way stage 1 did (a long-running container that loops the pipeline), but its volume mount is just <code>./policy</code> (read-write, so it can write <code>whitelist.json</code>) and <code>./seed.toml</code> — '''no Docker socket''', because nGate no longer needs to restart any container. That removes the single biggest security caveat of the stage-1 sidecar (mounting <code>/var/run/docker.sock</code> gave the sidecar effective host root).
+
+== Common Problems and Fixes ==
+
+''(Several of these were hit and fixed during the first real deploy of this guide to <code>nostr.hive-book.com</code> — they are reproducible first-boot traps, not edge cases. If you're following along on a fresh box you will probably meet the first three.)''
+
+;strfry crash-loops with <code>Unable to set NOFILES limit to 1000000, exceeds max of 524288</code>
+:strfry tries to raise its open-file limit to 1,000,000 on startup; almost every VPS caps lower, so the <code>setrlimit</code> fails, you see <code>atexit</code>, and the container restarts forever. The relay '''log will say <code>CONFIG: successfully installed</code> right before the error''' — that is a red herring; the config parsed, the limit call is what failed. '''Fix:''' set <code>nofiles = 0</code> '''inside the <code>relay { }</code> block''' of <code>strfry.conf</code> (Step 8 already does this in the current guide). <code>0</code> = "inherit the container's limit, don't try to raise it" — host-independent.
+:'''The subtle part:''' <code>nofiles</code> is '''only''' read inside <code>relay { }</code>. If you put it at the '''top level''' of <code>strfry.conf</code> (a natural mistake), strfry's tolerant parser still prints <code>CONFIG: successfully installed</code> but '''silently ignores the key''' and keeps the built-in 1,000,000 default — so 0, 524288, and anything in between all behave identically (still crashing). If you tried several values and "nothing changed", this is why: wrong scope, not wrong value. Verify the running container's view with <code>docker compose run --rm --entrypoint sh nostr-relay -c 'grep -n nofiles /etc/strfry.conf'</code> '''and''' confirm the line sits under <code>relay {</code>.
+
+;Edited <code>strfry.conf</code> but the old behaviour persists / logs show old timestamps
+:strfry reads its config '''once, at process start''' — it does not watch the file. A bind-mounted config change is not picked up by a still-running (or merely <code>restart</code>ed) container, and a crash-looping container may have read the old file before you edited it. '''Always''' apply config changes with <code>docker compose up -d --force-recreate nostr-relay</code>, then read '''fresh''' log lines: <code>docker compose logs --since 2m -f nostr-relay</code>. Check the timestamps are newer than your edit — debugging against stale log output wastes a lot of time. (This is the opposite of the '''whitelist''' file, which the plugin re-reads live — see "Whitelist change didn't take effect" below. Config = static-at-start; whitelist data = live.)
+
+;<code>nak ... status 502</code> / clients can't connect, "failed to connect to any of the given relays"
+:A <code>502 Bad Gateway</code> from your domain means '''Caddy is up but its upstream (the strfry container) is not listening''' — almost always because strfry is crash-looping (see the NOFILES entry above). '''Fix strfry first; the 502 disappears on its own.''' Don't debug the 502 as a separate problem until <code>docker compose ps</code> shows <code>nostr-relay</code> as a stable <code>Up</code> (not restarting). Only if strfry is confirmed <code>Up</code> '''and''' you still get 502 is it a real proxy issue — then check the Caddyfile upstream name/port (<code>nostr-relay:7777</code>) and that both services share the compose network.
+
+;<code>nak event</code> succeeds to send but the relay replies <code>msg: error: internal error</code> (reads work, writes fail)
+:The write-policy plugin can't execute. The official strfry image is <code>FROM alpine</code> — busybox <code>sh</code> only, '''no <code>bash</code>, no <code>jq</code>'''. The Step 9 plugin is bash (associative arrays, <code>${var,,}</code>, process substitution) and calls <code>jq</code>, so inside stock strfry the kernel can't even exec it and strfry returns its generic <code>internal error</code> for every write. Reads work because the plugin is only invoked on writes. '''Confirm:''' <code>docker compose exec nostr-relay sh -lc 'which bash; which jq'</code> — both empty. '''Fix:''' build and run the <code>strfry-ngate:1.0.4</code> wrapper image from Step 7 (<code>apk add --no-cache bash jq</code>) and set <code>image: strfry-ngate:1.0.4</code> in compose (Step 12), then <code>docker compose up -d --force-recreate nostr-relay</code>. Re-test: a whitelisted key now publishes <code>success.</code>, a non-whitelisted key gets <code>blocked: not on relay whitelist</code> (the plugin's own message — proof it's running).
+
+;"Nothing changed in the whitelist" but the apply log said it wrote keys
+:Almost always a filename mix-up. <code>ngate-strfry-apply.sh</code> writes '''<code>whitelist.json</code>'''. The plugin script is '''<code>whitelist-policy.sh</code>'''. There is no <code>whitelist-policy.json</code> — if you <code>cat</code> that you're reading a stray/old file (delete it). Trust the apply script's own last line: <code>✓ wrote N key(s) to /opt/nostr-relay/policy/whitelist.json</code> — <code>cat</code> '''that exact path'''.
+
+;Doubled log lines in <code>docker compose logs</code>
+:Usually a stray leftover container from an earlier <code>docker compose run --rm</code> one-off running alongside the real service. <code>docker compose ps -a</code>; if you see a <code>...-run-...</code> container, <code>docker compose down &amp;&amp; docker compose up -d</code> to clean. If only one container shows and lines are still doubled, it's just loguru writing to stderr that compose echoes — harmless.
+
+;Caddy can't get a cert
+:DNS for <code>nostr.v4call.com</code> isn't resolving to this box yet. <code>dig +short nostr.v4call.com</code> must return the VPS IP. Wait, re-check, restart Caddy.
+
+;Every event is rejected, even whitelisted keys
+:(a) <code>whitelist.json</code> holds '''npub''', not hex — the plugin compares hex. Convert (Step 6). (b) Hex case mismatch — the plugin lowercases both sides, so this shouldn't bite, but double-check the file has no stray quotes/commas (<code>jq . whitelist.json</code> must parse). (c) The <code>./policy</code> mount path inside the container doesn't match <code>strfry.conf</code>'s <code>writePolicy.plugin</code> path.
+
+;strfry won't start / "config file not found"
+:Your pinned strfry tag expects the config at a different path than <code>/etc/strfry.conf</code>. Run <code>docker run --rm strfry:1.0.4 --help</code>, find the expected path, fix the bind-mount target in compose. Pin a known tag; don't track <code>master</code>.
+
+;Plugin "permission denied" in the relay log
+:<code>chmod +x /opt/nostr-relay/policy/whitelist-policy.sh</code>. Also confirm it has a valid shebang and Unix line endings (<code>file whitelist-policy.sh</code> should not say "CRLF").
+
+;LMDB / database permission errors
+:Same class of issue as the stage-1 nostr-rs-relay SQLite UID gotcha. strfry's container user must be able to write <code>/app/strfry-db</code>. Quick fix on a single-purpose box of public events: <code>chmod -R 777 /opt/nostr-relay/strfry-db</code>. Cleaner fix: <code>chown</code> to the container's UID.
+
+;Whitelist change didn't take effect
+:The plugin reloads on '''mtime change'''. If you edited in place with an editor that preserves mtime (rare) or wrote without changing the file, touch it: <code>touch /opt/nostr-relay/policy/whitelist.json</code>. Always use the atomic <code>tmp</code> + <code>mv</code> pattern (as <code>ngate-strfry-apply.sh</code> does) — it guarantees a new mtime and never exposes a half-written file to the plugin.
+
+;Build killed (OOM) on a small VPS
+:Add swap (Step 7) and rebuild. The C++ compile is the only memory-hungry part; once the image exists, runtime RAM is small.
+
+== What's deferred ==
+
+Honest scope notes, so nobody is surprised later:
+
+* '''3-strike miss tolerance + state.json''' — <code>ngate-apply.sh</code> (stage 1) tolerates a key being briefly missing from Hive for N cycles before removing it ([[CLAUDE.md]] decision #4), tracked in <code>state.json</code>. The minimal <code>ngate-strfry-apply.sh</code> above is '''recompute-fresh each run''' (seed ∪ current verified+gated set). That is safe and matches nGate's "Hive is source of truth, ADD-only on partial failure" philosophy '''only if''' you keep nGate's existing ADD-only guard in <code>ngate-sync.sh</code> (don't pass <code>--allow-removals</code> on a partial upstream failure). Porting the full miss-counter/state machinery to the strfry backend is a follow-up, not done here.
+* '''Restart cap / sanity bound''' — intentionally '''dropped''', not ported. There is no restart, so a restart loop is impossible by construction. The sanity bound (refuse to empty the whitelist on garbage upstream) is still worth porting later as a guard against a bad scan nuking the file; for now the seed-merge means the operator's own key always survives.
+* '''High-throughput plugin''' — bash+jq per event is fine for a low-rate federation-discovery relay. If this relay ever becomes a busy public one, rewrite the plugin in Go/Rust. Note it; don't pre-optimise.
+
+These are tracked against Stage 4 in [[STATUS.md]].
+
+== Tips for Noobs ==
+
+* '''The plugin is just a program that answers yes/no per event.''' If you can write a shell script, you can write a strfry policy. Test it by hand: <code>echo '{"type":"new","event":{"id":"x","pubkey":"abc"}}' | ./policy/whitelist-policy.sh</code> should print an accept/reject line.
+* '''Atomic writes always.''' Any time something rewrites <code>whitelist.json</code> — nGate, you by hand, a cron — write to a temp file then <code>mv</code>. <code>mv</code> on the same filesystem is atomic; the plugin never sees a half-file, and mtime always bumps so the reload fires.
+* '''seed.toml is your seatbelt.''' Put your own key there before first start. Even if every scan fails forever, you can still publish.
+* '''Read is public, write is gated.''' That's the model. Anyone can read your relay's events; only whitelisted keys can write. If you want private reads too, that's a different (and more complex) NIP-42 auth setup — out of scope here.
+* '''strfry ≠ nostr-rs-relay config.''' Don't copy a <code>config.toml</code> across. Different daemon, different config language. The only thing that carries over conceptually is "a list of allowed hex pubkeys" — and now that list is a live file, not a restart-on-change config block.
+* '''Keep the strfry tag pinned.''' <code>strfry:1.0.4</code>, not <code>strfry:latest</code>. When you choose to upgrade, do it deliberately: bump the tag, <code>git checkout</code> the new release, rebuild, test Step 14 + 15 again.
+
+----
+''Part of the v4call / nGate documentation set. See also: [[Nostr Relay With a 3-Key Whitelist]] (stage 1, nostr-rs-relay), [[nGate-auto-whitelist]] (stage 3, the scan→verify→gate→apply pipeline), [[V4call]] (the platform this federation-discovery layer serves).''

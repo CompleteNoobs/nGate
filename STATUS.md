@@ -170,6 +170,36 @@ AND-only or operator-configurable; token model (a) vs (b).
 
 ## Recent meaningful changes (last few sessions)
 
+- **2026-05-18**: **Stage 4 strfry walkthrough written + live-deployed +
+  proven reproducible.** New `walkthrough-strfry.wiki` (Ubuntu 24.04, Docker,
+  Caddy, write-policy plugin, nGate wiring, cron). Debugged live on
+  *both* nostr.hive-book.com and nostr.v4call.com; every gotcha hit was
+  folded back into the doc in first-boot order: (1) strfry `nofiles` must be
+  **inside `relay { }`** (top-level is silently ignored → 1,000,000 default →
+  crash-loop; the resulting Caddy 502 is a downstream symptom); (2) stock
+  strfry image is Alpine — **no bash/jq** — so the policy plugin can't exec
+  and every publish returns `error: internal error`: fixed with a 2-line
+  `Dockerfile.relay` wrapper (`FROM strfry:1.0.4` + `apk add bash jq`),
+  run image is `strfry-ngate:1.0.4`; (3) config edits need
+  `--force-recreate` (strfry reads config once at start); (4) cloned
+  `ngate-strfry-apply.sh` shipped without the exec bit → `Permission denied`
+  + broken-pipe (only one verify line, whitelist unchanged) — **fixed in the
+  repo via `git update-index --chmod=+x`** so fresh clones are correct.
+  `ngate-strfry-apply.sh` now lives in `scripts/`. The big confirmed win:
+  whitelist updates are a live `whitelist.json` rewrite — **no relay
+  restart**, so the stage-1 restart-cap/sanity-bound machinery is moot here.
+- **2026-05-18**: Stage 3.7 Part B — prorated-deposit worked example
+  recorded (no build; deferred per user). The model reduces to a single
+  linear constant: `entitlement_days = total_qualifying_HBD × (period_days /
+  fee_amount)`. User's worked numbers (1 HBD→10 d, 0.01 HBD→2 h 24 m,
+  12 HBD→120 d) ⇒ **0.1 HBD/day**, internally consistent. Sharper framing of
+  the still-open anchoring decision: **(a) anchor to first payment**
+  (`first_payment_time + total_days`, stateless-friendly, penalises early
+  payers) **vs (b) credit-budget that only counts down when the prior top-up
+  expires** (subscription-like, needs per-payment ledger reconstruction each
+  cycle). The existing STATUS formula `last_payment_time + total/rate` is the
+  last-wins variant of (a); pick (a) vs (b) explicitly before building.
+
 - **2026-05-17**: README.md gained a full "Configuration reference — every
   flag, what it does" section: pipeline-stage flag placement, complete env
   var / YAML tables for scan + gate (flat Mode A + split Mode B) + apply,
