@@ -60,9 +60,10 @@ Both work. The difference is '''how the whitelist is updated'''.
 * [[#Step_15:_Prove_Hot-Reload_Works|16 Step 15: Prove Hot-Reload Works (the whole point)]]
 * [[#Step_16:_Wire_in_nGate|17 Step 16: Wire in nGate]]
 * [[#Step_17:_Automate_It_with_cron|18 Step 17: Automate It with cron]]
-* [[#Common_Problems_and_Fixes|19 Common Problems and Fixes]]
-* [[#Whats_deferred|20 What's deferred]]
-* [[#Tips_for_Noobs|21 Tips for Noobs]]
+* [[#Step_18:_Optional_.E2.80.94_Per-User_Whitelisting_via_nostr-announce|19 Step 18: Optional — Per-User Whitelisting via <code>nostr-announce</code>]]
+* [[#Common_Problems_and_Fixes|20 Common Problems and Fixes]]
+* [[#Whats_deferred|21 What's deferred]]
+* [[#Tips_for_Noobs|22 Tips for Noobs]]
 
 == What You Need ==
 
@@ -641,6 +642,80 @@ This shim is '''not''' tested end-to-end the way the explicit-env pipeline above
 
 '''Alternative: a compose sidecar instead of cron.''' If you'd rather not use cron, add an nGate sidecar service to <code>docker-compose.yml</code> the same way stage 1 did (a long-running container that loops the pipeline), but its volume mount is just <code>./policy</code> (read-write, so it can write <code>whitelist.json</code>) and <code>./seed.toml</code> — '''no Docker socket''', because nGate no longer needs to restart any container. That removes the single biggest security caveat of the stage-1 sidecar (mounting <code>/var/run/docker.sock</code> gave the sidecar effective host root).
 
+== Step 18: Optional — Per-User Whitelisting via <code>nostr-announce</code> ==
+
+Everything up to Step 17 whitelists '''servers''' (one Hive post per v4call server, tagged <code>v4call-server</code>, scanned by <code>ngate-scan.sh</code>). This optional step adds a '''second parallel pipeline''' that whitelists '''individual users''' who publish a per-user Nostr-identity binding to Hive (one post per user, tagged <code>nostr-announce</code>, scanned by <code>ngate-user-scan.sh</code>). Both pipelines write to the same <code>policy/whitelist.json</code> — the strfry plugin doesn't care which pipeline added a key.
+
+'''Skip this step entirely''' if you only want server-tier whitelisting. The federation-discovery relay works perfectly without per-user gating; this is a separate use case (e.g. "anyone holding ≥3 CNOOBS can publish to my relay"), not a v4call-fed requirement.
+
+'''The user-facing tool''' that produces these posts ships in the v4call repo: '''<code>public/nostr-announce.html</code>''' ([https://github.com/CompleteNoobs/v4call/blob/main/public/nostr-announce.html source on GitHub], normally served at <code>https://your-v4call-server.com/nostr-announce.html</code>). A user opens the page, fills in their Hive account, pastes their Nostr <code>nsec</code> (which never leaves their browser), clicks '''Sign attestation''' — the page builds a kind-30078 Nostr event with the Hive account in a tag, signs it with the nsec entirely in-browser, embeds it (base64) in a Hive post titled <code>nostr-announce</code>, and broadcasts the post via Hive Keychain or a pasted Hive posting key. The nsec is wiped on a successful broadcast. The result is a Hive post whose body contains a <code>[V4CALL-NOSTR-BINDING-V1]</code> block — that's what nGate's user-side pipeline reads.
+
+=== What this pipeline does ===
+
+Per scheduled run (defaults: every 30 min via cron, exactly like the server pipeline):
+# '''<code>ngate-user-scan.sh</code>''' hits Hive RPC for the latest posts tagged <code>nostr-announce</code>, parses each <code>[V4CALL-NOSTR-BINDING-V1]</code> block, emits one NDJSON candidate per line. Read-only.
+# '''<code>ngate-user-verify.sh</code>''' base64-decodes each candidate's attestation, cryptographically verifies the kind-30078 Nostr event ('''same <code>lib/ngate-verify-nostr-event.mjs</code> helper used by the server pipeline'''), and asserts: <code>event.pubkey</code> matches the declared hex; <code>d</code>-tag is <code>v4call-nostr-binding</code>; <code>v4call_hive_account</code> tag matches '''both''' the post author '''and''' the body's <code>HIVE-ACCOUNT</code> field. Only passing rows go downstream. Read-only.
+# '''<code>ngate-gate.sh</code>''' (existing, unchanged) reads the rows on stdin, looks up each <code>hive_account</code>'s HP and/or token balance via Hive RPC + Hive-Engine, and lets through only those that meet the configured thresholds. Read-only.
+# '''<code>ngate-strfry-apply.sh</code>''' (existing, unchanged) merges the surviving hexes with <code>seed.toml</code>, atomically rewrites <code>policy/whitelist.json</code>, no restart. The plugin re-reads on mtime change at the very next event.
+
+The two scan/verify scripts mirror the existing <code>ngate-scan.sh</code> / <code>ngate-verify.sh</code> in style, dependencies, NDJSON shape, and exit codes. The downstream <code>ngate-gate.sh</code> and <code>ngate-strfry-apply.sh</code> are completely untouched — '''zero risk to your existing v4call-server pipeline''' from adding this step.
+
+=== Verify the scripts exist (after the next nGate pull) ===
+
+ cd /opt/nostr-relay/nGate
+ git pull
+ ls scripts/ngate-user-scan.sh scripts/ngate-user-verify.sh
+
+If they're missing, your local nGate clone is behind <code>main</code>. <code>git pull</code> in <code>/opt/nostr-relay/nGate</code> updates them. No <code>docker</code> rebuild needed — the nGate scripts run on the host, not inside the relay container.
+
+=== Smoke-test (read-only, no whitelist write) ===
+
+See what's currently discoverable without touching the whitelist:
+
+ cd /opt/nostr-relay/nGate/scripts
+ ./ngate-user-scan.sh | ./ngate-user-verify.sh | jq -c .
+
+Expected: zero or more NDJSON lines on stdout (each a verified per-user binding) plus chatty stderr from the scan and verify phases (<code>OK @user/permlink — …</code> or <code>REJECT …</code> with a clear reason).
+
+=== Dry-run the full pipeline with a real gate ===
+
+Add the gate you want — example below is "must hold ≥3 CNOOBS on the Hive account that signed the post":
+
+ cd /opt/nostr-relay/nGate/scripts
+ ./ngate-user-scan.sh | ./ngate-user-verify.sh | \
+   NGATE_GATE_ACCOUNT=hive_account NGATE_MIN_TOKEN_SYMBOL=CNOOBS NGATE_MIN_TOKEN_AMOUNT=3 \
+     ./ngate-gate.sh | \
+   ./ngate-strfry-apply.sh        # dry-run (default; nGate convention)
+
+The last line ends with <code>DRY-RUN: would write N key(s) to /opt/nostr-relay/policy/whitelist.json</code>. Read the gate log lines on stderr to confirm the right accounts passed/failed before you go live.
+
+=== Schedule it (test relay first) ===
+
+Add to <code>crontab -e</code>, '''same box, separate lock file and log''' so it never blocks the existing v4call-server cron and so diagnostics stay clean:
+
+<pre>
+# nostr-announce per-user pipeline — runs every 30 min, parallel to the v4call-server one
+*/30 * * * * cd /opt/nostr-relay/nGate/scripts && flock -n /tmp/ngate-user.lock bash -c './ngate-user-scan.sh | ./ngate-user-verify.sh | NGATE_GATE_ACCOUNT=hive_account NGATE_MIN_TOKEN_SYMBOL=CNOOBS NGATE_MIN_TOKEN_AMOUNT=3 ./ngate-gate.sh | NGATE_MAX_CONSECUTIVE_MISSES=1 ./ngate-strfry-apply.sh --apply --allow-removals' >> /opt/nostr-relay/ngate-user-cron.log 2>&1
+</pre>
+
+'''Two new things in this line vs the v4call-server cron:'''
+* '''<code>/tmp/ngate-user.lock</code>''' (not <code>/tmp/ngate.lock</code>) — separate flock so the user-scan can run alongside the server-scan; one slow Hive node won't make the other pipeline skip its turn.
+* '''<code>ngate-user-cron.log</code>''' — separate log file makes "did the user gate prune anyone today?" a one-line <code>grep</code> instead of digging through interleaved server-side noise.
+
+'''<code>--allow-removals</code> tells the apply step it's OK to remove keys that no longer pass the gate''' (e.g. a user dropped below 3 CNOOBS). Without it, the whitelist is ADD-only — that's deliberately the safer default but you almost certainly want removals on for a per-user economic gate. Pair with <code>NGATE_MAX_CONSECUTIVE_MISSES=1</code> so a single transient Hive-RPC error doesn't auto-evict — the row has to be genuinely missing on two consecutive runs to drop.
+
+=== Test relay → production rollout discipline ===
+
+Same posture as the v4call-server pipeline: '''don't add this cron line to a production relay until the test relay has run it cleanly for at least a few cycles.''' Watch <code>tail -f /opt/nostr-relay/ngate-user-cron.log</code>, watch the strfry log for the plugin's <code>[whitelist-policy] reloaded: N key(s)</code> lines, and confirm new keys show up in <code>cat /opt/nostr-relay/policy/whitelist.json</code> only when you expect them to.
+
+=== What this step does NOT do ===
+
+Honest scope:
+* '''Does not change the strfry policy plugin.''' The plugin still only checks "is this pubkey in the whitelist?" Per-user and per-server keys are indistinguishable to it. If you want different gating rules per source you'd need a smarter plugin and a second whitelist file — not done here.
+* '''Does not enforce kind restrictions.''' A whitelisted user can publish kind 1, kind 30078, kind anything to your relay. Gating happens at identity, not content. If you want a kind allowlist on top, that's a plugin-level change, not a whitelist-data change.
+* '''Does not edit any of the existing pipeline scripts.''' Step 16's <code>ngate-scan.sh</code> / <code>ngate-verify.sh</code> / <code>ngate-gate.sh</code> / <code>ngate-strfry-apply.sh</code> are byte-identical to before. This is purely additive.
+* '''Does not run inside the relay container.''' The nGate scripts run on the host via cron, write the whitelist file via the bind-mounted <code>./policy</code> directory. The strfry container only reads — no Docker socket needed, no relay-restart needed, no image rebuild needed.
+
 == Common Problems and Fixes ==
 
 ''(Several of these were hit and fixed during the first real deploy of this guide to <code>nostr.hive-book.com</code> — they are reproducible first-boot traps, not edge cases. If you're following along on a fresh box you will probably meet the first three.)''
@@ -684,6 +759,18 @@ This shim is '''not''' tested end-to-end the way the explicit-env pipeline above
 
 ;Build killed (OOM) on a small VPS
 :Add swap (Step 7) and rebuild. The C++ compile is the only memory-hungry part; once the image exists, runtime RAM is small.
+
+;<code>ngate-user-scan.sh</code> finds posts but <code>ngate-user-verify.sh</code> rejects '''every one''' with "attestation v4call_hive_account tag ≠ post author"
+:The post was authored by one Hive account but its body's attestation tags name a different Hive account. Usually means somebody copy-pasted the body of someone else's <code>nostr-announce</code> post into their own draft and re-posted under their own account — the Nostr signature is still valid (the original signer's nsec produced it) but the tag no longer matches the new author, so the bind is broken on purpose. This is '''the system working''' — a real binding requires the original signer to publish under '''their own''' Hive account. Tell the user to re-sign in <code>nostr-announce.html</code> using their own Hive account + their own nsec, then re-post.
+
+;<code>ngate-user-verify.sh</code> rejects a post with "attestation v4call_hive_account tag ≠ body HIVE-ACCOUNT field"
+:The post body's <code>HIVE-ACCOUNT:</code> line says <code>alice</code> but the signed attestation inside it names <code>bob</code>. Same class as above — usually a copy-paste mistake or an attempt to fool a casual reader who only skims the body. The verify rejects on the cryptographic tag, not the human-readable body line, so this never reaches the whitelist. Re-sign in <code>nostr-announce.html</code> with the correct Hive account in the form field, the page generates a fresh attestation, post again.
+
+;<code>ngate-user-verify.sh</code> says "missing nostr_pubkey_hex or nostr_attestation_b64"
+:The post body is missing one of the required fields in the <code>[V4CALL-NOSTR-BINDING-V1]</code> block. Almost always because the user posted manually via peakd.com / hive.blog instead of using <code>nostr-announce.html</code> and forgot a line. Easiest fix: use the tool — it builds the block correctly every time.
+
+;User gets <code>Post failed: unknown error</code> in <code>nostr-announce.html</code>
+:Almost never a v4call/nGate bug. Two Hive-side causes: (a) Hive enforces a '''~5 minute gap between posts from the same account''' — if the user posted anything (this binding, a regular post, anything) less than 5 min ago, the broadcast fails. Wait, retry. (b) '''Low Resource Credits''', especially on fresh accounts with no staked Hive Power — check at <code>https://hivestats.io/@username</code>. Browser DevTools Console shows the full Hive response which usually carries the actual reason.
 
 == What's deferred ==
 
