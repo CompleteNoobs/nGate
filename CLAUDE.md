@@ -295,9 +295,16 @@ Adopted across all 5 nGate scripts:
   a cumulative-paid fee. User wants this before Stage 4 strfry.
 - **Stage 4** — strfry migration. Live policy plugin replaces the
   config.toml-rewrite-and-restart loop.
-- **Stage 5** — user-tier nGate. Same architecture, scans v4call-rates
-  instead of v4call-server, different d-tag scope. Separate relay tier from
-  federation-tier.
+- **Stage 5** — user-tier nGate. Same architecture, scans per-user posts
+  instead of v4call-server, different d-tag scope
+  (`v4call-user-cross-attestation`). Separate relay tier from federation-tier.
+  **Current:** `ngate-user-scan.sh` discovers BOTH `nostr-announce` posts
+  (`V4CALL-NOSTR-BINDING-V1` block, from nostr-announce.html) AND v4call's unified
+  `user-announce` posts (`[NOSTR-V1]` block, from user-announce.html). **✅ DONE
+  2026-06-16** — two-pass scan (one per Hive tag); the `[NOSTR-V1]` pass maps the
+  unprefixed `NPUB`/`HEX`/`RELAYS`/`ATTESTATION` fields and uses the post AUTHOR as
+  the Hive account (the block omits HIVE-ACCOUNT). Legacy pass unchanged; output
+  contract + downstream verify/gate/apply unchanged.
 - **Stage 6+** — v4call uses nGate-published Nostr events as primary
   federation discovery (Hive posts remain as cryptographic anchor).
 

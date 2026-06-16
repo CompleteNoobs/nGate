@@ -1,0 +1,199 @@
+{{:LICENCE_HEADER_MIT}}
+
+
+= How to Create a Nostr Relay with Blockchain Conditions =
+
+From CompleteNoobs
+
+A '''Nostr relay''' is a small server that other people's apps connect to in order to send and receive messages. Most relays are open — anyone with a Nostr key can publish to them, which makes them easy to use but also easy to spam. This guide shows you how to run one with a '''rule of your choosing''' attached to the front door: '''only accounts that hold at least N of a custom token on the Hive blockchain can publish.''' Read-only access stays open to everyone.
+
+If you have ever wanted to run a small community space where '''members are proven by what they hold, not who they emailed''', this is one of the simplest ways to do it. The token can be one you minted yourself (a few minutes' work on Hive-Engine), one your community already uses, or one you accept on someone else's behalf.
+
+'''Payment-on-the-door is coming soon''' — a future revision of this guide will add "pay X HBD to be whitelisted for Y days" alongside the "hold N tokens" rule. The pieces below are deliberately structured so that drop-in is small. For now: hold-to-publish.
+
+== What you'll have running after this guide ==
+
+* A live Nostr relay at <code>wss://nostr.YOUR-DOMAIN</code>, on a small VPS you control.
+* A '''token gate''': a background job that watches the Hive blockchain every 30 minutes, and keeps your relay's whitelist in sync with who currently holds enough of your chosen token.
+* A '''one-page sign-up flow''' your users can run in any browser to prove they hold the token and ask to be whitelisted. No accounts, no passwords, no email — the proof is cryptographic, signed in their browser, posted to the public blockchain.
+* '''Auto-pruning''': when a user's balance drops below your threshold, the next scheduled run removes them from the whitelist. Top them back up and the run after that adds them again. No manual list-keeping.
+* '''A read-side that stays public.''' Anyone can subscribe to and read events on your relay; only token-holders can publish. (You can lock down reads too if you want, but that needs a different setup — out of scope here.)
+
+== A real example, to make the pieces feel concrete ==
+
+Alice runs a small music project. She wants a private-ish hangout for the people who actively support her — not a paywall, not a Discord, just a Nostr relay where her supporters can chat without random spammers walking in.
+
+She does these things, once:
+
+# Mints a custom token on Hive-Engine called <code>ALICETOKEN</code>. (Hive-Engine's standard token-creation fee is 100 BEE — about US $4 at time of writing, paid once. The token is hers; she can airdrop, sell, or hand it out however she likes.)
+# Follows '''this guide''' to bring up a Nostr relay at <code>nostr.aliceradio.example</code>, gated on "holds ≥ 50 ALICETOKEN."
+# Gives 50 ALICETOKEN to each person she wants to invite. They each spend two minutes in a browser tool to sign a proof and publish it to Hive; within 30 minutes nGate sees the proof, checks their balance, and adds them to the relay's whitelist.
+
+That's the whole flow. If Alice later wants the bar lower she changes a single number in a cron line; if she wants to use a different token, she changes a symbol. If a supporter sells their ALICETOKEN, the next run quietly removes them — no awkward unbanning conversation.
+
+The same shape works for: '''a DAO''' gating its announce channel on holding the governance token; '''a paid newsletter''' gating an AMA channel on subscriber-tier tokens; '''a creator''' running a 1-of-1-tier holders chat; '''a project''' gating contributor chat on a non-transferable proof token. None of this needs payment processors, KYC, or platform approval — Hive carries the proof, you carry the relay.
+
+== The big picture, in plain English ==
+
+Four players:
+
+* '''You (the operator)''' — run the relay and the gate. Set the rule. Don't touch anything per-user.
+* '''The token issuer''' — whoever minted the token your gate listens for. Often this is also you. Could be a third party.
+* '''The token holder''' — your future user. Has a Hive account, holds at least your threshold of the token, and wants to use the relay.
+* '''The Hive blockchain''' — the public, auditable place where token balances live and where users post their "I hold this and want in" proofs.
+
+What happens, once everything is running:
+
+# A token holder opens a small browser tool (<code>nostr-announce.html</code> in the v4call repo — more on this below). They type in their Hive username, paste their Nostr private key (it never leaves the browser), and click '''Sign attestation'''.
+# The tool builds a cryptographically signed proof that binds their Nostr key to their Hive account, and broadcasts it as a Hive post.
+# Your relay's background job ('''nGate''') wakes up on its 30-minute cron, finds the post on Hive, verifies the cryptographic binding, then looks up that Hive account's token balance.
+# '''If the balance meets your threshold,''' the user's Nostr key is added to the relay's whitelist file. '''If not,''' nothing happens — no message, no record (per privacy by default; you can change this).
+# The relay's whitelist file is re-read live; the user can now publish from the very next event.
+# Every 30 minutes the cycle re-runs. Anyone whose balance has dropped below the threshold is removed. Anyone newly above it is added.
+
+You — the operator — never approve anyone by hand. Your only job after setup is to choose the token, choose the amount, and let the chain decide.
+
+== Why this is interesting ==
+
+* '''No accounts to manage.''' Hive identity is the account. You don't run a sign-up form, you don't store passwords, you don't reset anything.
+* '''The gate is data, not policy.''' Your relay enforces a single rule: "is this pubkey on the whitelist file?" The file is rewritten by the gate. The rule that decides who's on the file is one or two environment variables — change them, the next run reflects the change.
+* '''The proof is permanent and auditable.''' A user's binding lives on Hive forever; anyone (including future operators, anti-abuse tools, or other relays) can re-verify it without contacting you.
+* '''Read stays free.''' Anyone can subscribe and listen — your community can be heard without your community being a closed garden. Only the right to '''publish''' is gated.
+* '''It composes.''' The same gate the operator uses for "hold N CNOOBS" works for "hold N of any other Hive-Engine token", "hold N Hive Power", or "either ≥ 1000 HP OR ≥ 50 of token X". One config change.
+
+== What this is NOT ==
+
+Honest about scope, so nobody is surprised:
+
+* '''Not a payment processor.''' Today's version gates on '''holding''' the token, not on '''paying''' anyone. A future revision will add "pay HBD to be whitelisted for N days" — drop-in next to the hold-gate, not replacing it.
+* '''Not a Nostr social network.''' You're running a relay (transport), not a client (UI). Users connect to your relay with whatever Nostr client they prefer (Damus, Amethyst, Coracle, snort, etc.).
+* '''Not a content moderation system.''' Your gate decides '''who''' can publish, not '''what''' they can publish. If you need content moderation (e.g. only certain event kinds, no NSFW images, etc.), that's a separate plugin layer — see "Where to next" at the bottom.
+* '''Not a private read.''' All events published to your relay are readable by anyone who connects. If you need private reads, you want NIP-42 auth or end-to-end encrypted DMs — different setup.
+
+== Prerequisites ==
+
+* '''A small Linux VPS.''' Ubuntu 24.04, 1 GB RAM (2 GB more comfortable). Vultr, Hetzner, DigitalOcean, etc. — anything that gives you a public IP and root.
+* '''A domain name''' you control, with the ability to point a subdomain (e.g. <code>nostr.YOUR-DOMAIN</code>) at the VPS's IP via an A record.
+* '''A Hive account''' you control — yours, the operator. It will hold the '''seed key''' (your own Nostr key, so you can always publish to your own relay even if every external scan fails).
+* '''A Hive-Engine token''' you want to gate on. If you don't have one yet, [https://hive-engine.com Hive-Engine] lets you create one in a few minutes for a flat fee in BEE (around US $4 at time of writing). Your token, your rules — name it, supply-cap it, distribute it however you like.
+* '''[https://hive-keychain.com Hive Keychain] in your browser''' for the user-facing sign-up step (or, equivalently, the user pastes their Hive posting key directly into the tool — same security posture).
+* Optional but recommended: '''[https://github.com/hoytech/strfry strfry] basics''' — you'll be running it, but you don't need to know much about it; the linked walkthrough covers all the buttons.
+
+== Build it ==
+
+The mechanical setup is already documented step-by-step in two existing guides; this section tells you which steps from each, in what order, plus the one new piece that turns it from "v4call federation discovery relay" into "any-token gated relay."
+
+=== Phase 1 — Bring up the relay itself ===
+
+Follow '''Steps 1 through 15''' of [[Nostr_Relay_with_Live_Whitelist_(strfry)|walkthrough-strfry.wiki]] verbatim:
+
+* Point DNS, harden SSH, install Docker.
+* Build the strfry image with bash + jq baked in.
+* Write the strfry config and the small write-policy plugin (the plugin's only job is "is this pubkey on the whitelist? yes/no").
+* Drop your '''own''' Nostr public key into <code>seed.toml</code> — '''do this before first start''' or you will lock yourself out.
+* Bring up the relay behind Caddy for TLS, prove the whitelist works (whitelisted key publishes, non-whitelisted gets a clear rejection), prove the hot-reload works (edit the file, next event reloads — no restart).
+
+At the end of Phase 1 you have a working relay with a whitelist that is manually maintained. That's already useful; everything from here is automation.
+
+=== Phase 2 — Wire in nGate (the gate machinery) ===
+
+Follow '''Steps 16 and 17''' of the same [[Nostr_Relay_with_Live_Whitelist_(strfry)|walkthrough-strfry.wiki]]:
+
+* Clone nGate into <code>/opt/nostr-relay/nGate</code>, install its Node dependencies (<code>npm install</code> in <code>scripts/</code>).
+* Add a cron line that runs every 30 minutes.
+
+At the end of Phase 2 you have nGate scanning Hive for the '''default''' set of posts (v4call-server announces, used by the v4call platform's own federation). If you don't run v4call, that scan returns zero results — '''that is fine'''. Phase 3 swaps in the scan you actually want.
+
+=== Phase 3 — Add the per-user token gate (the new piece) ===
+
+Follow '''Step 18''' of [[Nostr_Relay_with_Live_Whitelist_(strfry)|walkthrough-strfry.wiki]] — the step exists exactly for this use case. The short version: nGate ships two extra scripts, <code>ngate-user-scan.sh</code> and <code>ngate-user-verify.sh</code>, that read posts tagged <code>nostr-announce</code> on Hive and pipe them into the existing gate. You add '''one cron line''' (separate lock file, separate log) with the token symbol and amount you want.
+
+The example in the guide uses <code>CNOOBS</code> and an amount of <code>3</code>. '''For your own use, change those two values to your own token and your own threshold''' and you're done.
+
+Concretely, the only line you'll need to adjust:
+
+<pre>
+NGATE_GATE_ACCOUNT=hive_account NGATE_MIN_TOKEN_SYMBOL=ALICETOKEN NGATE_MIN_TOKEN_AMOUNT=50
+</pre>
+
+That single env-var block is your '''entire policy''': "the Hive account that signed the post must hold at least 50 ALICETOKEN to be whitelisted." Run the dry-run command from Step 18 first, see who passes, then switch the cron to <code>--apply</code>.
+
+== Inviting users (their side) ==
+
+Once your relay is live and gating, this is what you tell a prospective user. Copy/paste — it's their full instructions:
+
+# '''Get a Hive account''' if you don't have one. [https://signup.hive.io signup.hive.io] is the easiest place; many wallets work too.
+# '''Get [https://hive-keychain.com Hive Keychain]''' as a browser extension (desktop only; iOS has limits — see the FAQ below).
+# '''Get the token I'm gating on.''' [Tell them: which token, how much, where they can get it — your token, your distribution channel. If you're airdropping, just send it to them.]
+# '''Get a Nostr key''' if you don't have one. Either install a Nostr client like [https://snort.social snort.social] or [https://damus.io Damus] which generate one for you, OR open the standalone tool at <code>https://YOUR-V4CALL-SERVER.com/nostr-gen.html</code> (browser-only key generation — the key never leaves your machine; save the <code>nsec</code> somewhere safe).
+# '''Sign and publish the binding.''' Open <code>https://YOUR-V4CALL-SERVER.com/nostr-announce.html</code> ([https://github.com/CompleteNoobs/v4call/blob/main/public/nostr-announce.html source on GitHub]). Type in your Hive username, paste your Nostr <code>nsec</code>, click '''Sign attestation''', then click '''Post to Hive''' (Keychain signs the Hive post). The <code>nsec</code> is wiped from the tool on a successful broadcast.
+# '''Wait up to 30 minutes.''' nGate's next cron run picks up your post, verifies the binding, checks your token balance, and adds your Nostr key to the relay's whitelist. From that point on, any Nostr client pointed at <code>wss://nostr.YOUR-DOMAIN</code> can publish using your key.
+
+A user only needs to do steps 5 and 6 '''once'''. After that they keep their key in their wallet/client and use the relay normally. If they ever drop below your token threshold the gate will quietly remove them; topping back up and waiting one cron cycle puts them back in.
+
+'''Don't have a v4call server to host the sign-up page for them?''' You can host the single HTML file <code>nostr-announce.html</code> anywhere — it's a static page, doesn't need a backend. Grab it from [https://github.com/CompleteNoobs/v4call/blob/main/public/nostr-announce.html the v4call repo on GitHub] and serve it from any web server you control (Caddy on the same VPS works fine, or GitHub Pages, or Netlify, or your laptop for testing).
+
+== Tuning the gate ==
+
+Once it's running you can change the rule in seconds by editing the cron line. nGate's gate phase is configured purely via environment variables; the change takes effect on the next scheduled run.
+
+Some useful dials:
+
+* '''Raise the bar:''' <code>NGATE_MIN_TOKEN_AMOUNT=100</code> — anyone now needs 100 of the token to keep posting access. People who drop below are auto-pruned within one cron cycle.
+* '''Switch tokens:''' <code>NGATE_MIN_TOKEN_SYMBOL=YOURNEWTOKEN</code> — instantly migrate the gate to a different Hive-Engine token. (Users still need to '''re-publish''' a binding only if they are publishing under a different Hive account; same Hive account = same binding still works.)
+* '''Add a Hive Power floor:''' <code>NGATE_MIN_HP=100</code> in addition to the token settings. By default, '''OR''' logic — either condition passes. Add <code>NGATE_GATE_MODE=and</code> to require both.
+* '''Count staked tokens:''' default is on (<code>NGATE_INCLUDE_STAKED_TOKEN=true</code>) — staked + liquid both count. Set to <code>false</code> if you only want to credit liquid balances.
+* '''Don't count delegated HP:''' default is off (<code>NGATE_INCLUDE_DELEGATED_HP=false</code>) — only owned HP counts, so a whale can't rent out access. Flip to <code>true</code> only if you specifically want delegations to count.
+* '''Per-account split:''' you can gate one account on HP and a different account on token balance (e.g. for projects with separate operator and treasury accounts). See the comments at the top of <code>ngate-gate.sh</code> for the full <code>NGATE_ESCROW_*</code> / <code>NGATE_HIVE_*</code> shape.
+
+== Frequently asked questions ==
+
+;Why Hive? Why not Ethereum / Bitcoin / Solana?
+:Hive transactions are '''free and fast''' (3-second blocks, no fees for normal operations). Custom tokens cost a flat one-time fee to mint and then move free forever. The signing keys (posting key for posts, active key for transfers) keep "publish to a blog" and "move money" cleanly separated. For a gate that needs to read balances and verify signed posts cheaply on every cycle, Hive is genuinely the path of least resistance. The same gate shape could be ported to any chain — Hive was first because the cost/UX math worked best.
+
+;Do I need to know how to write code?
+:No. The two new scripts (<code>ngate-user-scan.sh</code> and <code>ngate-user-verify.sh</code>) are already written. The strfry plugin is already written. nGate's gate logic is already written. Your job is editing two values (token symbol, threshold) in a cron line. If you want to '''change''' the rules later (e.g. add a content filter), that's where some scripting helps — but for hold-to-publish you can copy/paste the whole thing.
+
+;How much does this cost to run?
+:VPS: ~$5–$10/month for a 1-2 GB box (Vultr, Hetzner, etc.). Domain: ~$10–$15/year. Hive-Engine token mint (one-time, only if you're making your own token): ~$4 in BEE. TLS via Caddy: free (Let's Encrypt). Nothing else recurring.
+
+;What if my user has Hive Keychain on iOS / mobile?
+:Hive Keychain's iOS app exists but doesn't inject the <code>window.hive_keychain</code> object that the web pages look for (Apple's WebKit doesn't allow extensions to do that). So '''the sign-up page works on desktop with Keychain, or on any browser with a pasted Hive posting key.''' Mobile sign-up via Keychain is on the v4call roadmap (HiveSigner OAuth flow as an alternative), but for today: tell mobile-only users to use the posting-key paste option, or to do the sign-up step once from any desktop browser.
+
+;What happens if my VPS goes down for a few hours?
+:Reads pause (no relay to connect to). When the box comes back, strfry resumes; the next nGate cron runs on schedule. Nothing on Hive is lost — every binding is permanent on the chain — so the state self-heals.
+
+;What happens if Hive's RPC nodes are flaky during a scan?
+:nGate uses a multi-node fallback chain (four nodes by default; tries each until one returns a usable response). If '''all''' nodes fail, the run aborts cleanly without touching the whitelist — '''it does not auto-empty the whitelist on a transient outage'''. The <code>--allow-removals</code> + <code>NGATE_MAX_CONSECUTIVE_MISSES=1</code> flags mean a key has to be genuinely absent on '''two consecutive''' runs (after a successful scan) before it's pruned.
+
+;Can a user fake a binding?
+:Not without both the Hive posting key AND the matching Nostr <code>nsec</code> for the accounts they're claiming. The binding ties them together with a cryptographic signature that nGate re-verifies on every scan. Forging requires owning both keys — at which point you '''are''' that user, so there's nothing to fake.
+
+;Can I read the whitelist file to see who's currently allowed?
+:Yes — it lives at <code>/opt/nostr-relay/policy/whitelist.json</code>. It's a plain JSON array of hex Nostr pubkeys. Anyone with shell access to your box can read it. If you want to know '''which Hive account''' each hex maps to, grep the cron log (<code>/opt/nostr-relay/ngate-user-cron.log</code>) — each <code>OK</code> line names the account.
+
+;Can I run this without v4call?
+:Yes. v4call is a separate platform that happens to share nGate. For this guide you only need: strfry, nGate, and the <code>nostr-announce.html</code> static file (which you can host on any web server, no v4call backend required).
+
+;A user wants to switch their Nostr key. How?
+:They sign a new binding in <code>nostr-announce.html</code> with their new <code>nsec</code>, post it. Next cron run picks up the new binding; the old key is no longer linked to their Hive account (the verifier reads the most recent valid binding per account). Their old key is also no longer in the whitelist after the run — automatic key rotation, no operator involvement.
+
+;What about payment-on-the-door?
+:Planned. The shape will be: a user pays X HBD to your operator-controlled escrow with a memo referencing their Nostr pubkey; nGate sees the transfer, whitelists the key for the agreed window. This is additive to (not replacing) the hold-N-tokens gate — you'll be able to mix and match: "hold N TOKEN '''or''' pay HBD." When it lands it'll be a Step 19 in <code>walkthrough-strfry.wiki</code>, no breaking changes to the steps above.
+
+== Where to next ==
+
+* '''[[Nostr_Relay_with_Live_Whitelist_(strfry)|walkthrough-strfry.wiki]]''' — the underlying step-by-step the three phases above link to. If you want to know what every config line means, that's the reference.
+* '''[[V4call]]''' — the federation/comms platform that produced <code>nostr-announce.html</code>. If you want to '''be a user''' as well as a relay operator, set up a v4call server and your Nostr relay can be the federation-discovery layer for it.
+* '''[https://github.com/CompleteNoobs/v4call v4call on GitHub]''' — source for the sign-up tool, the rate-editor, and the operator pages.
+* '''[https://github.com/CompleteNoobs/ngate nGate on GitHub]''' — source for the scan / verify / gate / apply scripts. Forks welcome.
+* '''Need a content filter on top of the token gate?''' That's a strfry plugin change (not a whitelist change). The current plugin only checks "is this pubkey allowed?" Adding "AND the event kind is in this allowlist" is a few lines of bash on top — out of scope here, but mentioned as a natural next step.
+
+== Getting help ==
+
+* Read the '''Common Problems and Fixes''' section of [[Nostr_Relay_with_Live_Whitelist_(strfry)|walkthrough-strfry.wiki]] first — most first-deploy traps are documented there with symptom + fix.
+* Open an issue on [https://github.com/CompleteNoobs/ngate/issues nGate's GitHub] for nGate bugs, or [https://github.com/CompleteNoobs/v4call/issues v4call's] for sign-up tool bugs.
+* Stuck on Hive / Hive-Engine basics (creating a token, getting Resource Credits, etc.)? [https://hive.io/community Hive's community resources] are the best starting point.
+
+----
+''Part of the CompleteNoobs walkthroughs. See also: [[Nostr_Relay_with_Live_Whitelist_(strfry)|the strfry build walkthrough]] and [[V4call|the v4call platform]].''

@@ -1,5 +1,7 @@
 # nGate
 
+> ⚠️ **Proof of concept — not for real use.** nGate, along with its sister projects [v4call](https://github.com/CompleteNoobs/v4call) and [IPFS-Gate](https://github.com/CompleteNoobs/IPFS-Gate), are **proof-of-concept builds by independent builders** — not production software. They are **not safe to use** and **not recommended for general users**. They are provided for developers who want to review the code and are willing to take the risks of an early, quickly-built concept. Treat everything as a demo, not a service.
+
 Automated whitelist gate for a Nostr relay, driven by Hive blockchain announces.
 
 nGate scans Hive every N hours for `v4call-server` posts, cryptographically

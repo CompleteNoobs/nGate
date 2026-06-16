@@ -1,5 +1,7 @@
 # STATUS.md — nGate Current State
 
+> ⚠️ **Proof of concept — not for real use.** nGate (with sister projects v4call and IPFS-Gate) is a **concept design build by independent builders** — not production software, not safe to use, not recommended for general users. For developers reviewing the code who accept the risks. Treat as a demo.
+
 **As of 2026-05-13.** Snapshot of what's done, what's open, what's planned.
 Read [CLAUDE.md](CLAUDE.md) first for project context.
 
@@ -50,17 +52,14 @@ See [CLAUDE.md](CLAUDE.md#locked-in-design-decisions-read-before-changing-anythi
 
 ## Known bugs / open issues
 
-### Re-sign + re-announce pending for existing operators
+### Re-sign + re-announce pending for existing operators — ✅ RESOLVED 2026-06-16
 
-All three v4call-server announces currently on Hive (cnoobs, v4call,
-hive-book) were either:
-- Pre-Nostr (no attestation at all), OR
-- Signed under the OLD canonical payload extension (Option A — included
-  attestation.id in the Hive sig)
-
-After the Option B revert, the user needs to re-sign + re-announce each
-operator before nGate-verify will accept them. **In flight.** Once done,
-the scan|verify chain should produce three green OKs.
+All three operators are now re-signed + re-announced under Option B. A live
+read-only `scan | verify` (2026-06-16) produced exactly the predicted **three
+green OKs** — `@completenoobs/call.completenoobs.com`, `@hive-book/hive-book.com`,
+`@v4call/v4call.com` all triple-bound (Hive sig + Nostr attestation valid).
+Older duplicate posts with stale attestations are correctly REJECTed
+("well-known X differs from post"); that's expected churn, not a bug.
 
 ### Re-deploy to live relays pending
 
@@ -102,8 +101,17 @@ In rough priority:
    config.toml-rewrite-and-restart loop. The nGate phase scripts carry
    over almost unchanged; only the apply phase swaps backend.
 5. **Stage 5** — user-tier nGate. Same architecture, different scan target
-   (v4call-rates instead of v4call-server) and d-tag scope
-   (`v4call-user-cross-attestation`).
+   (per-user posts instead of v4call-server) and d-tag scope
+   (`v4call-user-cross-attestation`). **Current:** `ngate-user-scan.sh` reads
+   BOTH user-tier formats — legacy `nostr-announce` posts (`V4CALL-NOSTR-BINDING-V1`
+   block) AND v4call's unified `user-announce` posts (`[NOSTR-V1]` block).
+   **✅ DONE 2026-06-16 — the DOCS-TODO below is closed.** `ngate-user-scan.sh` now
+   runs two passes (one per tag); the `[NOSTR-V1]` pass maps the unprefixed fields
+   `NPUB`/`HEX`/`ATTESTATION` to the normalised output and uses the post AUTHOR as
+   `hive_account` (the block omits HIVE-ACCOUNT). Legacy pass preserved verbatim;
+   output contract + downstream `ngate-user-verify.sh` unchanged (verified live:
+   legacy candidate still OK; 5 live `user-announce` posts fetched, correctly
+   skipped for having no `[NOSTR-V1]` binding; synthetic `[NOSTR-V1]` parse proven).
 
 ## Stage 3.7 design — Economic subscription / per-account-pair gate
 
@@ -170,6 +178,26 @@ AND-only or operator-configurable; token model (a) vs (b).
 
 ## Recent meaningful changes (last few sessions)
 
+- **2026-06-16**: **Stage-5 `ngate-user-scan.sh` now reads v4call's unified
+  `user-announce` posts** (`[NOSTR-V1]` block) in addition to legacy
+  `nostr-announce` posts — closes the long-standing DOCS-TODO. Two-pass scan
+  (one Hive tag each); shared fetch/emit helpers; `[NOSTR-V1]` maps
+  `NPUB`/`HEX`/`ATTESTATION` and uses the post author as `hive_account` (block has
+  no HIVE-ACCOUNT). Legacy pass byte-identical; output contract + downstream
+  verify unchanged. Verified: bash syntax, `--help`, deterministic `[NOSTR-V1]`
+  parse (incl. no `^HEX:`/`NOSTR-HEX:` bleed), live scan (legacy candidate emits +
+  verifies OK; 5 live user-announce posts fetched, skipped for no Nostr binding).
+- **2026-06-16**: **Live health check + decoupling-compatibility confirmed.**
+  Read-only `ngate-scan | ngate-verify` against live Hive: 16 posts → **3 green
+  triple-bound OKs** (completenoobs, hive-book, v4call); stale dup posts correctly
+  rejected. Confirms the re-sign/re-announce queue is done and nGate is correctly
+  gating the 3 vetted operators. **Decoupling note:** verify fetches each
+  operator's `/.well-known/v4call-server.json`; in the decoupling effort that file
+  is now served by **v4call-node** via a new `GET /.well-known/v4call-server.json`
+  route that returns the operator's signed file **verbatim** — same bytes nGate
+  already verifies, so operators migrating monolith→v4call-node keep verifying
+  clean. No nGate change needed for decoupling. (See `~/CAI/handover-decoupling.md`
+  §11 step 3.)
 - **2026-05-18**: **Stage 4 strfry walkthrough written + live-deployed +
   proven reproducible.** New `walkthrough-strfry.wiki` (Ubuntu 24.04, Docker,
   Caddy, write-policy plugin, nGate wiring, cron). Debugged live on
