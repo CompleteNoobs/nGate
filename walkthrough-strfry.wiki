@@ -185,6 +185,8 @@ This one edit is what turns "box OOM-kills the compiler / freezes" into "slow bu
 '''Lever 2 — add swap BEFORE you build.''' Even 2 GB of swap turns "unresponsive / OOM" into "sluggish but still loggable, and the build completes". The swap commands are right after this box — run them '''first'''.
 
  sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+ # make it survive a reboot (the commands above only enable swap for THIS boot):
+ grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 '''Lever 3 — never lose your session.''' Start the build inside <code>tmux</code> (or <code>screen</code>) so a dropped connection or a lock-up doesn't kill the build or lock you out:
 
@@ -205,17 +207,21 @@ Also open your '''second SSH session before''' starting the build, not after —
  git submodule update --init
  # Pin to a release tag (check https://github.com/hoytech/strfry/releases for the latest)
  git checkout 1.0.4
+
+'''On a 1-core / ≤1 GB box, do these two things BEFORE <code>docker build</code>''' — they are prerequisites, not recovery steps (skipping them is how the box OOM-freezes mid-compile):
+
+ # 1. lower the compile parallelism to 1 (extra jobs just thrash a single core + swap)
+ sed -i 's/make -j4/make -j1/' Dockerfile
+ # 2. add swap and make it persist (see the low-power box above for why)
+ sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+ grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+Then build:
+
  docker build -t strfry:1.0.4 .
  cd /opt/nostr-relay
 
-This compiles strfry inside Docker. It is the slow step — '''5–15 minutes''' and a chunk of RAM. If the build is killed (OOM) on a 1 GB box, add swap first:
-
- sudo fallocate -l 2G /swapfile
- sudo chmod 600 /swapfile
- sudo mkswap /swapfile
- sudo swapon /swapfile
-
-then re-run <code>docker build</code>.
+This compiles strfry inside Docker. It is the slow step and a chunk of RAM. Budget '''5–15 minutes on a 2+ GB / multi-core box''', but on the smallest '''1-core / 1 GB''' box expect '''~40 minutes''' — a single translation unit (<code>build/main.cpp</code>, compiled <code>-O3</code>) alone can take ~35 min there while swap churns. '''A silent, output-less build is normal''' — don't Ctrl-C it. If the build is still OOM-killed even with <code>-j1</code> + swap, that's the signal to size up the box; re-run <code>docker build</code> after adding more swap.
 
 '''Now build the nGate-flavoured image (REQUIRED — do not skip).''' The official strfry image is built <code>FROM alpine</code>, which ships busybox <code>sh</code> only — '''no <code>bash</code>, no <code>jq</code>'''. The write-policy plugin in Step 9 needs both. If you run the stock <code>strfry:1.0.4</code> image, the relay starts and serves reads fine, but '''every publish fails with <code>error: internal error</code>''' because the plugin can't execute (you'd waste an hour finding that out — we did). Bake the two tools in with a three-line wrapper image. Create <code>/opt/nostr-relay/Dockerfile.relay</code>:
 
@@ -460,6 +466,8 @@ You should get a rejection carrying <code>blocked: not on relay whitelist</code>
 
  nak req -k 1 wss://nostr.v4call.com
 
+'''Scripting these tests?''' Run each <code>nak</code> with its stdin closed — <code>nak event ... wss://nostr.v4call.com &lt; /dev/null</code>. Interactively <code>nak</code> is fine, but in a non-interactive shell (a script, a piped one-liner, cron) it can block waiting on stdin and look hung. Redirecting from <code>/dev/null</code> makes it return immediately with the relay's OK/blocked reply.
+
 == Step 15: Prove Hot-Reload Works (the whole point) ==
 
 This is the demo that justifies the whole strfry switch.
@@ -484,7 +492,7 @@ nGate's first three phases — <code>ngate-scan.sh</code> → <code>ngate-verify
 '''Get nGate onto the box.''' Clone the repo into the project folder and install its Node crypto-helper dependencies (dhive + nostr-tools — the phase scripts shell out to them for Hive ECDSA / Nostr schnorr verification):
 
  cd /opt/nostr-relay
- git clone https://github.com/completenoobs/ngate.git nGate
+ git clone https://github.com/CompleteNoobs/nGate.git nGate
  sudo apt install -y npm
  cd /opt/nostr-relay/nGate/scripts
  npm install
@@ -759,6 +767,15 @@ Honest scope:
 
 ;Build killed (OOM) on a small VPS
 :Add swap (Step 7) and rebuild. The C++ compile is the only memory-hungry part; once the image exists, runtime RAM is small.
+
+;Relay OOM-froze after a reboot even though the build worked yesterday
+:Your swap didn't persist. <code>fallocate/mkswap/swapon</code> only enable swap for the current boot — after a reboot it's gone and the box is back to bare RAM. Confirm with <code>swapon --show</code> (empty = no swap). Add the fstab line so it comes back automatically: <code>grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab</code> (Step 7 now does this).
+
+;Relay log fills with <code>HTTP request for [/.env]</code>, <code>[/.bash_history]</code>, <code>[/secrets.json]</code>, <code>zzcanary-…</code>
+:'''Not an error — internet background noise.''' The moment the relay is public, vulnerability scanners hammer the HTTPS endpoint probing for leaked secrets. Caddy proxies those plain-HTTP requests to strfry, which logs each as an <code>HTTP request for [path]</code> and serves them nothing (they aren't Nostr WebSocket upgrades). Nothing to fix; don't mistake it for a break-in. If the log noise bothers you, filter it at Caddy (only proxy WebSocket upgrades) — cosmetic, not security.
+
+;<code>ngate-verify.sh</code> Nostr step dies with <code>ERR_REQUIRE_ESM</code> / "require() of ES Module … not supported"
+:<code>nostr-tools</code> 2.x is ESM-only (its <code>@noble/curves</code> dep is pure ESM). That's exactly why the helper is <code>lib/ngate-verify-nostr-event.mjs</code> (an <code>.mjs</code> that <code>import</code>s it), not a <code>.js</code> that <code>require()</code>s it. If you see this error you (or an edit) switched the helper to CommonJS <code>require('nostr-tools')</code> — revert it to the shipped <code>.mjs</code>. The Hive helper (<code>ngate-verify-sig.js</code>) stays CJS because <code>@hiveio/dhive</code> is CJS-safe. Don't "unify" them.
 
 ;<code>ngate-user-scan.sh</code> finds posts but <code>ngate-user-verify.sh</code> rejects '''every one''' with "attestation v4call_hive_account tag ≠ post author"
 :The post was authored by one Hive account but its body's attestation tags name a different Hive account. Usually means somebody copy-pasted the body of someone else's <code>nostr-announce</code> post into their own draft and re-posted under their own account — the Nostr signature is still valid (the original signer's nsec produced it) but the tag no longer matches the new author, so the bind is broken on purpose. This is '''the system working''' — a real binding requires the original signer to publish under '''their own''' Hive account. Tell the user to re-sign in <code>nostr-announce.html</code> using their own Hive account + their own nsec, then re-post.
